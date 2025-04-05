@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from scipy.ndimage import gaussian_filter
-from matplotlib.colors import LightSource
+from matplotlib.colors import LightSource, Normalize
 from flood_tools import generate_boundary_mask 
 
 class FloodSimulation:
@@ -290,136 +290,181 @@ class FloodSimulation:
 
         return results, time_steps_list
 
-    def visualize_results(self, results, time_steps, output_path=None, show_animation=True, save_last_frame=True, include_rainfall=True):
-        """visualization of the flood simulation results"""
-        # Create a figure with larger size
-        fig, ax = plt.subplots(figsize=(12, 10))
+    def visualize_results(self, results, time_steps, output_path=None,
+                        show_animation=True, save_last_frame=True,
+                        hillshade=True, contour_levels=10):
+        """
+        Visualize the simulation results with enhanced terrain visualization.
+        Handles potential issues with empty or NaN results.
+
+        Parameters:
+        -----------
+        results : list : List of simulation results (2D arrays)
+        time_steps : list : List of time steps corresponding to results
+        output_path : str : Path to save the animation (optional)
+        show_animation : bool : Whether to display the animation
+        save_last_frame : bool : Whether to save the last frame as an image
+        hillshade : bool : Whether to include hillshade effect on terrain
+        contour_levels : int : Number of contour levels to display
+        """
+
+        if not results:
+            print("No results to visualize.")
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Determine color limits for water depth (Robust calculation) 
+        valid_maxes = []
+        for h in results:
+            # Consider only valid area for max depth calculation
+            if h is not None and h.size > 0 and self.valid_mask.shape == h.shape:
+                try:
+                    max_val = np.nanmax(h[self.valid_mask]) 
+                    if np.isfinite(max_val): valid_maxes.append(max_val)
+                except Exception: pass 
+
+
+        vmax = max(valid_maxes) if valid_maxes else 1.0
+        if vmax < self.min_depth: vmax = self.min_depth * 10
+        if np.isnan(vmax): vmax = 1.0
+        norm = Normalize(vmin=0, vmax=vmax)
         
-        # Create a hillshade for better terrain visualization
-        ls = LightSource(azdeg=315, altdeg=45)
-        dem_norm = (self.dem - np.min(self.dem)) / (np.max(self.dem) - np.min(self.dem) + 1e-6)
-        rgb = ls.shade(dem_norm, cmap=plt.cm.terrain, vert_exag=2, blend_mode='soft')
-        dem_plot = ax.imshow(rgb)
-        
-        # Adding improved contour lines - more levels, better visibility
-        contour_levels = np.linspace(np.min(self.dem), np.max(self.dem), 15)
-        contour = ax.contour(self.dem, colors='black', alpha=0.3, levels=contour_levels, linewidths=0.5)
-        
-        # Water visualization - better colormap and transparency
-        water_cmap = plt.cm.Blues_r.copy()
-        water_cmap.set_bad('none')
-        
-        # Increase water visibility threshold for clearer display
-        masked_water = np.ma.masked_where(results[0] < 0.02, results[0])
-        water_plot = ax.imshow(masked_water, cmap=water_cmap, vmin=0, 
-                            vmax=max(0.1, np.max([np.max(h) for h in results]) * 0.8),
-                            alpha=0.8)
-        
-        # Add colorbar with better formatting
-        cbar = plt.colorbar(water_plot, ax=ax, pad=0.01, label='Water Depth (m)')
-        cbar.ax.tick_params(labelsize=10) 
-        
-        # Rainfall visualization if needed
-        if include_rainfall and hasattr(self, 'rainfall'):
-            # Create a more natural rainfall effect
-            rain_dots = ax.scatter([], [], marker='.', color='royalblue', alpha=0.4, s=2, label='Rainfall')
-        
-        # Add water source marker if defined - larger and more visible
-        if hasattr(self, 'source_row') and hasattr(self, 'source_col'):
-            ax.plot(self.source_col, self.source_row, 'ro', markersize=10, label='Water Source')
-            # Add a circular marker around the source
-            circle = plt.Circle((self.source_col, self.source_row), 2, color='r', fill=False, linewidth=2)
-            ax.add_patch(circle)
-        
-        # Add legend with better formatting
-        if include_rainfall and hasattr(self, 'rainfall'):
-            ax.legend(loc='upper right', fontsize=10)
-        
-        # Add title with time information
-        title = ax.set_title(f'Flood Simulation (Time: {time_steps[0]:.2f} s)', fontsize=14)
-        
-        # Add grid lines for reference
-        ax.grid(False)
-        
-        def update(frame):
-            # Update water depth display with better masking
-            masked_water = np.ma.masked_where(results[frame] < 0.02, results[frame])
-            water_plot.set_array(masked_water)
+        # Plotting DEM background (mask invalid areas if desired)
+        dem_display = self.dem.copy()
+        dem_display[~self.valid_mask] = np.nan # Mask DEM for display
+
+        if hillshade:
+            ls = LightSource(azdeg=315, altdeg=45)
             
-            # Rainfall visualization with more natural scatter
-            if include_rainfall and hasattr(self, 'rainfall') and frame < (self.rain_duration or np.inf):
-                # Generate random rain dot positions based on rainfall distribution
-                positions = []
-                intensities = []
-                n_dots = 2000  
-                
-                # Find areas with rainfall
-                y_indices, x_indices = np.where(self.rain_distribution > 0.05)
-                if len(y_indices) > 0:
-                    # Randomly select positions weighted by rainfall intensity
-                    idx = np.random.choice(len(y_indices), size=min(n_dots, len(y_indices)), 
-                                        p=self.rain_distribution[y_indices, x_indices]/np.sum(self.rain_distribution[y_indices, x_indices]),
-                                        replace=True)
-                    
-                    
-                    jitter = 0.5
-                    x_with_jitter = x_indices[idx] + np.random.uniform(-jitter, jitter, size=len(idx))
-                    y_with_jitter = y_indices[idx] + np.random.uniform(-jitter, jitter, size=len(idx))
-                    
-                    rain_dots.set_offsets(np.column_stack([x_with_jitter, y_with_jitter]))
-                    
-                    # Adjust dot size based on intensity
-                    sizes = 2 + 3 * self.rain_distribution[y_indices[idx], x_indices[idx]]
-                    rain_dots.set_sizes(sizes)
-                else:
-                    rain_dots.set_offsets(np.empty((0, 2)))
+            # Calculate normalization only on valid DEM parts
+            dem_min_valid = np.nanmin(dem_display)
+            dem_max_valid = np.nanmax(dem_display)
+
+            if dem_max_valid > dem_min_valid:
+                # Create norm array, keeping NaNs
+                dem_norm_val = (dem_display - dem_min_valid) / (dem_max_valid - dem_min_valid)
+            else: # Handle flat valid terrain
+                dem_norm_val = np.full_like(dem_display, 0.5)
+                dem_norm_val[~self.valid_mask] = np.nan # Keep NaNs
+
+            # Shade
+            rgb = ls.shade(dem_norm_val, cmap=plt.cm.terrain, vert_exag=1.0, blend_mode='soft')
+            
+            # Set NaN areas in RGB to background color (e.g., transparent or specific color)
+            dem_plot = ax.imshow(rgb, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+        else:
+            # Use a colormap that handles NaN 
+            terrain_cmap = plt.cm.terrain
+            terrain_cmap.set_bad(color='none') 
+
+            dem_plot = ax.imshow(dem_display, cmap=terrain_cmap, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+            
+
+        # Add contour lines 
+        if contour_levels > 0:
+            ax.contour(dem_display, colors='black', alpha=0.3, levels=contour_levels,
+                    linewidths=0.5, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+
+        # Water visualization 
+        water_cmap = plt.cm.Blues
+        water_cmap.set_bad('none') 
+
+        first_frame = results[0]
+        if first_frame is not None and first_frame.size > 0:
+            # Mask outside area OR where depth is below minimum
+            mask = ~self.valid_mask | (first_frame <= self.min_depth)
+            masked_water = np.ma.masked_where(mask, first_frame)
+        else:
+            masked_water = np.ma.masked_array(np.zeros_like(self.dem), mask=True) # Empty
+
+        water_plot = ax.imshow(masked_water, cmap=water_cmap, norm=norm, alpha=0.7, 
+                            extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper', interpolation='none')
+
+        # Add colorbar for water depth
+        cbar = plt.colorbar(water_plot, ax=ax, pad=0.01, label='Water Depth (m)', shrink=0.7)
+
+        # Add water source markers
+        source_labels = []
+        for i, source in enumerate(self.sources):
+            x = (source['col'] + 0.5) * self.dx
+            y = (self.nx - 1 - source['row'] + 0.5) * self.dy
+            handle = ax.plot(x, y, 'ro', markersize=8, label=f'Source {i+1}')
+            source_labels.append(handle[0])
+        if source_labels:
+            ax.legend(handles=source_labels, loc='upper right')
+
+        # Add title and labels
+        title = ax.set_title(f'Flood Simulation (Time: {time_steps[0]:.2f} s)')
+        ax.set_xlabel("X distance (m)")
+        ax.set_ylabel("Y distance (m)")
+        ax.invert_yaxis()
+
+        # Animation update function
+        def update(frame_idx):
+            frame_data = results[frame_idx]
+            if frame_data is not None and frame_data.size > 0:
+                mask_update = ~self.valid_mask | (frame_data <= self.min_depth)
+                masked_water_update = np.ma.masked_where(mask_update, frame_data)
+                water_plot.set_array(masked_water_update)
             else:
-                rain_dots.set_offsets(np.empty((0, 2)))
-            
-            # Update title with current time
-            title.set_text(f'Flood Simulation (Time: {time_steps[frame]:.2f} s)')
-            
-            return water_plot, rain_dots, title
-        
-        # Create animation with improved performance
+                water_plot.set_array(np.ma.masked_array(np.zeros_like(self.dem), mask=True)) # Empty
+
+            title.set_text(f'Flood Simulation (Time: {time_steps[frame_idx]:.2f} s)')
+            return [water_plot, title]
+
+        # Create animation
         anim = animation.FuncAnimation(
-            fig, update, frames=len(results), 
-            interval=200, blit=True
+            fig, update, frames=len(results),
+            interval=150, blit=True, repeat=False
         )
-        
-        # Save animation if requested with better resolution
+
+        # Save animation if requested
         if output_path:
             try:
-                writer = animation.PillowWriter(fps=10)
-                anim.save(output_path, writer=writer, dpi=120)
-                print(f"Animation saved to {output_path}")
+                writer_name = None
+                if output_path.endswith('.gif'):
+                    writer_name = 'pillow'
+                elif output_path.endswith('.mp4'):
+                    writer_name = 'ffmpeg'
+                else:
+                    print("Warning: Unknown animation format. Attempting to save as GIF.")
+                    output_path = output_path.rsplit('.', 1)[0] + '.gif'
+                    writer_name = 'pillow'
+
+                if writer_name:
+                    print(f"Saving animation to {output_path} (using {writer_name})... this may take a while.")
+                    anim.save(output_path, writer=writer_name, fps=10, dpi=150)
+                    print("Animation saved.")
             except Exception as e:
-                print(f"Failed to save animation: {e}")
-                print("Trying alternative writer...")
-                try:
-                    writer = animation.FFMpegWriter(fps=10)
-                    anim.save(output_path.replace('.gif', '.mp4'), writer=writer, dpi=120)
-                    print(f"Animation saved with alternative writer")
-                except:
-                    print("Could not save animation. Try installing ffmpeg or pillow.")
-        
-        # Save last frame with high resolution if requested
+                print(f"Error saving animation: {e}")
+                print("Ensure required libraries (e.g., pillow, ffmpeg) are installed and accessible.")
+
+        # Save last frame if requested
         if save_last_frame and output_path:
-            # Update to show the last frame
-            update(len(results) - 1)
-            # Generate the last frame filename
-            last_frame_path = output_path.replace('.gif', '_final_frame.png')
-            last_frame_path = last_frame_path.replace('.mp4', '_final_frame.png')
-            
-            # Save the figure with high resolution
-            plt.savefig(last_frame_path, dpi=300, bbox_inches='tight')
-            print(f"Final frame saved to {last_frame_path}")
-        
+            try:
+                # Update plot to the last valid frame before saving
+                last_valid_frame_idx = len(results) - 1 
+                
+                if last_valid_frame_idx >= 0:
+                    update(last_valid_frame_idx) 
+                    last_frame_path = output_path.rsplit('.', 1)[0] + '_final_frame.png'
+                    plt.savefig(last_frame_path, dpi=300, bbox_inches='tight')
+                    print(f"Final frame saved to {last_frame_path}")
+                else:
+                    print("Could not save last frame: No valid result frames found.")
+            except Exception as e:
+                print(f"Error saving final frame: {e}")
+
         # Show animation if requested
         if show_animation:
             plt.tight_layout()
-            plt.show()
+            try:
+                plt.show()
+            except Exception as e:
+                print(f"Could not display animation interactively: {e}")
+                plt.close(fig) 
         else:
-            plt.close()
-            
+            plt.close(fig) 
+
         return anim
