@@ -14,6 +14,7 @@ class FloodSimulation:
         Initialize the flood simulation using the DEM data 
 
         Parameters:
+        -----------
         dem : numpy.ndarray : Digital Elevation Model (2D array of elevation values)
         valid_mask : numpy.ndarray : Mask indicating valid areas for simulation 
         dx, dy : float : Grid cell size in x and y directions
@@ -77,47 +78,61 @@ class FloodSimulation:
         # Ensure max trackers not set outside valid area
         self.max_flood_depth[~self.valid_mask] = np.nan 
 
-    def add_water_source(self, row, col, rate, duration=None):
-        """Add a water source at a specific location"""
-        self.source_row = row
-        self.source_col = col
-        self.source_rate = rate
-        self.source_duration = duration
-        self.source_steps = 0
+    def add_water_source(self, row, col, rate, duration_steps=None):
+        """
+        Add a water source at a specific location
+
+        Parameters:
+        -----------
+        row : int : Row index of the source
+        col : int : Column index of the source
+        rate : float : Rate of water source (m³/s)
+        duration_steps : int or None : Duration of source in simulation steps (None for unlimited)
+        """
         
-    def add_rainfall(self, rate, duration=None, spatial_distribution=None, time_pattern=None):
-        """Add rainfall with spatial and temporal distribution"""
-        self.rainfall = True
-        self.base_rain_rate = rate
-        self.rain_duration = duration
-        self.rain_steps = 0
+        self.sources.append({'row': row, 'col': col, 'rate': rate, 'duration': duration_steps, 'steps_active': 0})
+        print(f"Added source at ({row}, {col}), rate={rate} m³/s, duration={duration_steps} steps")
         
-        # Set spatial distribution (default is uniform)
-        if spatial_distribution is None:
+    def add_rainfall(self, rate, duration_steps=None, spatial_distribution=None, time_pattern=None):
+        """
+        Add rainfall with spatial and temporal distribution
+        
+        Parameters:
+        -----------
+        rate : float : Rainfall rate (m/s)
+        duration_steps : int or None : Duration of rainfall in simulation steps (None for unlimited)
+        spatial_distribution : numpy.ndarray or None : Spatial distribution of rainfall (2D array)
+        time_pattern : function or None : Temporal pattern function (step, duration) -> intensity
+        """
+        # Spatial distribution 
+        if spatial_distribution is None: 
             # Instead of uniform rainfall, create a smoother pattern
-            self.rain_distribution = np.ones_like(self.dem)
+            dist = np.ones_like(self.dem)
             # Apply slight randomness to break uniformity
             noise = np.random.normal(1.0, 0.1, self.dem.shape)
-            self.rain_distribution *= noise
+            dist *= noise
             # Smooth the distribution
-            self.rain_distribution = gaussian_filter(self.rain_distribution, sigma=2.0)
+            dist = gaussian_filter(dist, sigma=2.0)
             # Normalize
-            self.rain_distribution /= np.max(self.rain_distribution)
+            dist /= np.max(dist)
         else:
             # Ensure correct shape and smooth input distribution
             assert spatial_distribution.shape == self.dem.shape, "Spatial distribution must match DEM shape"
-            self.rain_distribution = np.maximum(0, spatial_distribution)
+            dist = np.maximum(0, spatial_distribution)
             # Smooth the distribution
-            self.rain_distribution = gaussian_filter(self.rain_distribution, sigma=2.0)
+            dist = gaussian_filter(dist, sigma=2.0)
             # Normalize
-            if np.max(self.rain_distribution) > 0:
-                self.rain_distribution /= np.max(self.rain_distribution)
-            
-        # Set temporal pattern (default is constant)
-        if time_pattern is None:
-            self.rain_time_pattern = lambda step, duration: 1.0
-        else:
-            self.rain_time_pattern = time_pattern
+            if np.max(dist) > 0:
+                dist /= np.max(dist)
+
+        # Temporal pattern
+        if time_pattern is None: 
+            pattern = lambda step, duration: 1.0
+        else: 
+            pattern = time_pattern
+
+        self.rainfall = {'rate': rate, 'duration': duration_steps, 'steps_active': 0, 'distribution': dist, 'time_pattern': pattern}
+        print(f"Added rainfall: rate={rate} m/s, duration={duration_steps} steps")
 
     def compute_fluxes(self):
         """Compute fluxes using the improved shallow water equations"""
