@@ -192,4 +192,74 @@ def load_dem_from_file(file_path, preprocess=True, smooth_sigma=0.5, fill_sinks_
     dem[~valid_mask] = np.nan
 
     return dem, valid_mask, metadata
-    
+
+def generate_boundary_mask(dem, valid_mask, outlet_threshold_percentile=5.0):
+    """
+    Generates a boundary mask for potentially irregular shapes defined by valid_mask.
+    Codes: -1: Outside/NoData, 0: Internal, 1: Wall, 2: Open Outlet.
+
+    Parameters:
+    -----------
+    dem : numpy.ndarray : The input Digital Elevation Model (potentially with NaNs).
+    valid_mask : numpy.ndarray (bool) : Mask == True for valid data cells, False for NoData/NaN cells.
+    outlet_threshold_percentile : float : Points along the *true boundary* below this elevation percentile are considered potential outlets.
+
+    Returns:
+    --------
+    boundary_mask : numpy.ndarray (int) : Integer mask (-1, 0, 1, 2).
+    """
+    ny, nx = dem.shape
+    # Initialize mask: -1 outside, 0 inside valid area
+    boundary_mask = np.full((ny, nx), -1, dtype=np.int32)
+    boundary_mask[valid_mask] = 0 # Mark valid cells as Internal=0 initially
+
+    true_boundary_indices = []
+    true_boundary_elevations = []
+
+    # Iterate through valid cells to find those adjacent to invalid cells
+    rows, cols = np.where(valid_mask) # Get indices of valid cells
+    for r, c in zip(rows, cols):
+        is_boundary = False
+        # Check 4 neighbors (N, S, E, W)
+        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            neighbor_r, neighbor_c = r + dr, c + dc
+            # Check if neighbor is within array bounds
+            if 0 <= neighbor_r < ny and 0 <= neighbor_c < nx:
+                # If neighbor is invalid, then current valid cell (r, c) is a boundary
+                if not valid_mask[neighbor_r, neighbor_c]:
+                    is_boundary = True
+                    break 
+            else:
+                 # Cells on the edge of the *array* are also boundaries if they are valid
+                is_boundary = True
+                break
+
+        if is_boundary:
+            boundary_mask[r, c] = 1 # Mark as Default Wall=1
+            true_boundary_indices.append((r, c))
+            true_boundary_elevations.append(dem[r, c])
+
+    if not true_boundary_indices:
+        print("Warning: No true boundary cells identified. Check DEM and valid_mask.")
+        return boundary_mask # Return mask with only 0 and -1
+
+    # Identify potential outlets AMONG the true boundary cells
+    # Allow disabling outlet detection by setting threshold to 100% or higher
+    if outlet_threshold_percentile < 100: 
+        # Filter out NaN elevations just in case
+        valid_boundary_elevations = [e for e in true_boundary_elevations if not np.isnan(e)]
+        if not valid_boundary_elevations:
+            print("Warning: All true boundary cells have NaN elevation. Cannot identify outlets.")
+            return boundary_mask
+
+        outlet_elevation_threshold = np.percentile(valid_boundary_elevations, outlet_threshold_percentile)
+
+        # Mark low points *on the true boundary* as potential outlets (Open=2)
+        for idx, elev in zip(true_boundary_indices, true_boundary_elevations):
+            if not np.isnan(elev) and elev <= outlet_elevation_threshold:
+                boundary_mask[idx] = 2 
+
+    num_outlets = np.sum(boundary_mask == 2)
+    num_walls = np.sum(boundary_mask == 1)
+    print(f"Generated boundary mask: {num_walls} wall cells, {num_outlets} potential outlet cells identified.")
+    return boundary_mask
