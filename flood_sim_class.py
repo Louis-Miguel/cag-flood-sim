@@ -1,8 +1,10 @@
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from scipy.ndimage import gaussian_filter
 from matplotlib.colors import LightSource
+from flood_tools import generate_boundary_mask 
 
 class FloodSimulation:
     def __init__(self, dem, valid_mask, 
@@ -43,7 +45,7 @@ class FloodSimulation:
         self.min_depth = float(min_depth)
         self.min_depth = float(min_depth)
 
-        # Generate boundary mask based on DEM and valid_mask 
+        # Generate boundary mask based on DEM and valid_mask
         self.boundary_mask = generate_boundary_mask(self.dem, self.valid_mask, outlet_threshold_percentile)
 
         # Initialize SWE variable arrays 
@@ -52,7 +54,7 @@ class FloodSimulation:
         self.v = np.zeros_like(self.dem, dtype=np.float64)
         self.nx, self.ny = self.dem.shape
 
-        # Zeroing the water depth in invalid areas since the velecities are already zeroed 
+        # Zeroing the water depth in invalid areas since the velecities are already zeroed
         self.h[~self.valid_mask] = 0.0
 
         # Initial timestep guess (use stats only from valid areas)
@@ -76,7 +78,7 @@ class FloodSimulation:
         self.max_flood_depth = np.zeros_like(self.dem)
         
         # Ensure max trackers not set outside valid area
-        self.max_flood_depth[~self.valid_mask] = np.nan 
+        self.max_flood_depth[~self.valid_mask] = np.nan
 
     def add_water_source(self, row, col, rate, duration_steps=None):
         """
@@ -134,117 +136,159 @@ class FloodSimulation:
         self.rainfall = {'rate': rate, 'duration': duration_steps, 'steps_active': 0, 'distribution': dist, 'time_pattern': pattern}
         print(f"Added rainfall: rate={rate} m/s, duration={duration_steps} steps")
 
-    def compute_fluxes(self):
-        """Compute fluxes using the improved shallow water equations"""
-        # Adaptive timestep if enabled - more conservative approach
+    def apply_sources_or_rainfall(self, h_current):
+        """
+        Apply water sources or rainfall to the current state
+        """
+        h_new = h_current.copy()
+        # Apply water sources
+        for source in self.sources:
+            if source['duration'] is None or source['steps_active'] < source['duration']:
+                volume_per_step = source['rate'] * self.dt
+                depth_increase = volume_per_step / (self.dx * self.dy)
+                h_new[source['row'], source['col']] = max(0.0, h_new[source['row'], source['col']] + depth_increase) 
+                source['steps_active'] += 1
+        # Apply rainfall
+        if self.rainfall:
+            if self.rainfall['duration'] is None or self.rainfall['steps_active'] < self.rainfall['duration']:
+                time_factor = self.rainfall['time_pattern'](self.rainfall['steps_active'], self.rainfall['duration'])
+                effective_rate = self.rainfall['base_rate'] * time_factor
+                rainfall_depth = effective_rate * self.dt * self.rainfall['distribution']
+                h_new += np.maximum(0.0, rainfall_depth) 
+                self.rainfall['steps_active'] += 1
+        return h_new
+
+    def compute_fluxes_and_update(self):
+        """
+        Compute fluxes and update state variables
+        """
         if self.adaptive_timestep:
-            # Compute maximum velocity
-            max_vel = np.sqrt(np.nanmax(self.u**2 + self.v**2) + 1e-6)
-            max_depth = np.nanmax(self.h)
+            # Calculate stats only on valid cells 
+            h_valid = self.h[self.valid_mask]
+            u_valid = self.u[self.valid_mask]
+            v_valid = self.v[self.valid_mask]
+
+            with np.errstate(invalid='ignore'):
+                # Use valid subsets for max calculations
+                max_vel_sq = np.max(u_valid**2 + v_valid**2) if u_valid.size > 0 else 0.0
+                max_vel = np.sqrt(max_vel_sq)
+                max_depth = np.max(h_valid) if h_valid.size > 0 else 0.0
+
+            if np.isnan(max_vel): max_vel = 0.0
+            if np.isnan(max_depth): max_depth = 0.0
+
+            # Adjust timestep based on CFL condition (Courant-Friedrichs-Lewy (CFL) condition)
+            wave_speed = np.sqrt(self.g * max(max_depth, self.min_depth))
+            dt_cfl = self.stability_factor * min(self.dx, self.dy) / (wave_speed + max_vel + 1e-6)
             
-            # Adjust timestep based on CFL condition with lower factor (Courant-Friedrichs-Lewy (CFL) condition)
-            wave_speed = np.sqrt(self.g * max_depth + 1e-6)
-            if wave_speed > 0:
-                dt_cfl = self.stability_factor * min(self.dx, self.dy) / (wave_speed + max_vel + 1e-6)
-                self.dt = min(self.original_dt, dt_cfl)
-        
-        # Use numba version of compute flux (faster) (need pip install numba)
-        h_new, u_new, v_new = compute_fluxes_numba(
-            self.h, self.u, self.v, self.dem, 
-            self.dx, self.dy, self.dt, 
-            self.g, self.manning, self.max_velocity
+            # More conservative approach
+            max_dt_allowed = max(self.original_dt_guess, self.dt * 1.5)
+            self.dt = min(dt_cfl, max_dt_allowed)
+
+            if self.dt < 1e-9: 
+                print("Warning: Timestep extremely small...") 
+                self.dt = 1e-9
+
+        # Call numba function
+        h_new, u_new, v_new = compute_step_jit(
+            self.h, self.u, self.v, self.dem, self.boundary_mask, # Pass mask
+            self.g, self.manning, self.dx, self.dy, self.dt,
+            self.infiltration_rate, self.min_depth
         )
-        
-        # Add water source if defined 
-        if hasattr(self, 'source_row') and (self.source_duration is None or self.source_steps < self.source_duration):
-            volume_per_step = self.source_rate * self.dt
-            # Distribute source over a small area for stability
-            r, c = self.source_row, self.source_col
-            radius = 2
-            for i in range(max(1, r-radius), min(self.nx-1, r+radius+1)):
-                for j in range(max(1, c-radius), min(self.ny-1, c+radius+1)):
-                    dist = np.sqrt((i-r)**2 + (j-c)**2)
-                    if dist <= radius:
-                        weight = (1.0 - dist/radius)**2
-                        h_new[i, j] += weight * volume_per_step / (self.dx * self.dy * np.pi * radius**2)
-            self.source_steps += 1
 
-        # Add rainfallon
-        if hasattr(self, 'rainfall') and (self.rain_duration is None or self.rain_steps < self.rain_duration):
-            # Calculate rain intensity with temporal pattern
-            time_factor = self.rain_time_pattern(self.rain_steps, self.rain_duration)
-            effective_rate = self.base_rain_rate * time_factor
-            
-            # Apply spatial distribution with smoothness
-            rainfall_volume = effective_rate * self.dt * self.rain_distribution
-            
-            # Add rainfall to water depth
-            h_new += rainfall_volume
-            
-            self.rain_steps += 1
-        
-        # Update max flood extent and depth trackers
-        self.max_flood_extent = np.logical_or(self.max_flood_extent, h_new > 0.01)
-        self.max_flood_depth = np.maximum(self.max_flood_depth, h_new)
+        # Post-computation checks/updates (apply only to valid area)
 
-        # Update state variables
+        # Velocity Clipping
+        vel_new_sq = u_new**2 + v_new**2
+        scale = np.ones_like(vel_new_sq)
+        mask_to_scale = self.valid_mask & (vel_new_sq > self.max_velocity**2)
+        if np.any(mask_to_scale):
+            scale[mask_to_scale] = self.max_velocity / (np.sqrt(vel_new_sq[mask_to_scale]) + 1e-9)
+        u_new *= scale
+        v_new *= scale
+
+        # Apply Sources/Rainfall
+        h_new = self.apply_sources_or_rainfall(h_new)
+
+        # Update State Variables
         self.h = h_new
         self.u = u_new
         self.v = v_new
+        self.h[~self.valid_mask] = 0.0 # Ensure h is 0 outside
+        self.u[~self.valid_mask] = 0.0 # Ensure u is 0 outside
+        self.v[~self.valid_mask] = 0.0 # Ensure v is 0 outside
+
+        # Update Max Flood Trackers
+        is_flooded = self.valid_mask & (self.h > self.min_depth)
+        self.max_flood_extent = np.logical_or(self.max_flood_extent, is_flooded)
+        # Update max depth only where flooded
+        self.max_flood_depth = np.maximum(self.max_flood_depth, np.where(is_flooded, self.h, 0))
+        # Ensure max depth outside valid area remains NaN (or 0 if preferred)
+        self.max_flood_depth[~self.valid_mask] = np.nan
 
     def run_simulation(self, num_steps, output_freq=10):
-        """Run simulation with performance monitoring"""
-        import time
-        
-        # Initialize results list
+        """
+        Run the flood simulation for a specified number of steps
+        """
+        # Initialize results
         results = []
-        time_steps = []
+        time_steps_list = []
         total_time = 0.0
-        
-        # Run simulation
+        start_run_time = time.time()
+
+        # Run simulation loop
         for step in range(num_steps):
-            step_start_time = time.time()
-            
-            if step % output_freq == 0:
-                # Store results
-                results.append(self.h.copy())
-                time_steps.append(total_time)
-                
-                # Report stats
-                max_depth = np.nanmax(self.h)
-                max_vel = np.sqrt(np.nanmax(self.u**2 + self.v**2) + 1e-6)
-                print(f"Step {step}/{num_steps}, Time: {total_time:.2f}s, Max depth: {max_depth:.2f} m")
-                
-                # Report performance if available
-                if len(self.computation_times) > 0:
-                    avg_step_time = np.mean(self.computation_times[-output_freq:])
-                    print(f"Avg computation time per step: {avg_step_time:.4f}s")
-            
-            # Compute the next step
-            self.compute_fluxes()
-            
-            # Measure step time
-            step_time = time.time() - step_start_time
-            self.computation_times.append(step_time)
-            
+            self.current_step = step
+
+            # Compute fluxes and update state variables and check for errors
+            try: 
+                self.compute_fluxes_and_update()
+            except Exception as e: 
+                print(f"\n--- ERROR occurred at step {step}, time {total_time:.2f}s ---\n{e}") 
+                break 
+
             total_time += self.dt
-        
-        # Add final state if not already added
-        if len(results) == 0 or not np.array_equal(results[-1], self.h):
-            results.append(self.h.copy())
-            time_steps.append(total_time)
-        
-        # Print final flood statistics
-        flood_area = np.sum(self.max_flood_extent) * self.dx * self.dy
-        flood_volume = np.sum(self.max_flood_depth) * self.dx * self.dy
-        print(f"Final maximum flood area: {flood_area:.2f} m², Maximum flood volume: {flood_volume:.2f} m³")
-        
-        # Performance summary
-        if len(self.computation_times) > 0:
-            print(f"Average computation time per step: {np.mean(self.computation_times):.4f}s")
-            print(f"Total computation time: {np.sum(self.computation_times):.2f}s")
-            
-        return results, time_steps
+
+            # Display progress and show results at the end
+            if step % output_freq == 0 or step == num_steps - 1:
+                results.append(self.h.copy())
+                time_steps_list.append(total_time)
+
+                # Compute max depth and velocity
+                with np.errstate(invalid='ignore'): 
+                    max_depth = np.nanmax(self.h)
+                    max_vel = np.sqrt(np.nanmax(self.u**2 + self.v**2))
+                
+                # Handle NaN values
+                max_depth = 0.0 if np.isnan(max_depth) else max_depth
+                max_vel = 0.0 if np.isnan(max_vel) else max_vel
+
+                # Compute flood area and volume
+                flood_area = np.sum(self.h > self.min_depth) * self.dx * self.dy
+                flood_volume = np.sum(self.h[self.h > 0]) * self.dx * self.dy
+                
+                # Print progress and stop if unstable
+                print(
+                    f"Step {step}/{num_steps - 1}, "
+                    f"Sim Time: {total_time:.3f}s, "
+                    f"dt: {self.dt:.4f}s, "
+                    f"Max Depth: {max_depth:.3f}m, "
+                    f"Max Vel: {max_vel:.3f}m/s, "
+                    f"Area: {flood_area:.1f}m², "
+                    f"Vol: {flood_volume:.1f}m³"
+                )
+                if not np.isfinite(max_depth) or max_depth > 1000:
+                    print(" Warning: Simulation may be unstable. Stopping.")
+                    break
+
+        end_run_time = time.time()
+        print(f"\nSimulation finished {step+1} steps in {end_run_time - start_run_time:.2f} seconds (wall clock).")
+        final_flood_area = np.sum(self.max_flood_extent) * self.dx * self.dy
+        max_recorded_depth = np.max(self.max_flood_depth) 
+        print(f"Final Maximum Flood Extent Area: {final_flood_area:.2f} m²")
+        print(f"Peak Recorded Water Depth Anywhere: {max_recorded_depth:.3f} m")
+
+        return results, time_steps_list
 
     def visualize_results(self, results, time_steps, output_path=None, show_animation=True, save_last_frame=True, include_rainfall=True):
         """visualization of the flood simulation results"""
