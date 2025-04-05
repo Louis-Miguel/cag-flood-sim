@@ -3,175 +3,79 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from scipy.ndimage import gaussian_filter
 from matplotlib.colors import LightSource
-import numba  # For performance optimization
-
-@numba.jit(nopython=True)
-def compute_fluxes_numba(h, u, v, dem, dx, dy, dt, g, manning, max_velocity):
-    """Optimized flux computation using Numba with improved flow routing"""
-    # Output arrays
-    h_new = np.zeros_like(h)
-    u_new = np.zeros_like(u)
-    v_new = np.zeros_like(v)
-    
-    # Constants
-    nx, ny = h.shape
-    min_depth = 0.005  # Increased minimum depth for better stability
-    max_grad = 0.5     # Reduced maximum gradient to prevent unrealistic flow
-    max_flux = 50.0    # Reduced max flux for stability
-    
-    # Water surface elevation (terrain + water)
-    eta = dem + h
-    
-    # Process each cell
-    for i in range(1, nx-1):
-        for j in range(1, ny-1):
-            # Compute water surface gradients in all 4 directions
-            # This improves flow direction accuracy
-            deta_e = eta[i, j+1] - eta[i, j]     # East
-            deta_w = eta[i, j] - eta[i, j-1]     # West
-            deta_n = eta[i+1, j] - eta[i, j]     # North
-            deta_s = eta[i, j] - eta[i-1, j]     # South
-            
-            # Use the steepest descent direction for flow
-            # This helps water flow naturally toward lower elevations
-            detadx = 0.0
-            if deta_e < 0 and abs(deta_e) > abs(deta_w):
-                detadx = deta_e / dx
-            elif deta_w < 0 and abs(deta_w) >= abs(deta_e):
-                detadx = -deta_w / dx
-                
-            detady = 0.0
-            if deta_n < 0 and abs(deta_n) > abs(deta_s):
-                detady = deta_n / dy
-            elif deta_s < 0 and abs(deta_s) >= abs(deta_n):
-                detady = -deta_s / dy
-            
-            # Limit gradient for stability
-            detadx = max(-max_grad, min(detadx, max_grad))
-            detady = max(-max_grad, min(detady, max_grad))
-
-            # Only compute velocity if there's water and a slope
-            if h[i, j] > min_depth:
-                # Compute momentum terms (Central Finite Difference d'x = (f(x+dx) - f(x-dx)) / 2dx)
-                dudx = (u[i, j+1] - u[i, j-1]) / (2 * dx)
-                dudy = (u[i+1, j] - u[i-1, j]) / (2 * dy)
-                dvdx = (v[i, j+1] - v[i, j-1]) / (2 * dx)
-                dvdy = (v[i+1, j] - v[i-1, j]) / (2 * dy)
-                
-                # Calculate friction (Manning equation)
-                h_safe = max(h[i, j], min_depth)
-                cf = g * manning**2 / (h_safe**(1/3))
-                cf = min(cf, 10.0)  # Limit friction coefficient
-                
-                vel_mag = np.sqrt(u[i, j]**2 + v[i, j]**2 + 1e-6)
-                friction_u = cf * u[i, j] * vel_mag
-                friction_v = cf * v[i, j] * vel_mag
-                
-                # Update velocities with better momentum conservation (Shallow Water Momntum Eqn)
-                du_dt = -g * detadx - friction_u
-                dv_dt = -g * detady - friction_v
-                
-                # Add inertia terms with damping for stability
-                du_dt -= 0.8 * (u[i, j] * dudx + v[i, j] * dudy)
-                dv_dt -= 0.8 * (u[i, j] * dvdx + v[i, j] * dvdy)
-                
-                # Forward Euler Method
-                u_new[i, j] = u[i, j] + dt * du_dt
-                v_new[i, j] = v[i, j] + dt * dv_dt
-                
-                # Apply velocity limits for stability
-                vel_mag_new = np.sqrt(u_new[i, j]**2 + v_new[i, j]**2)
-                if vel_mag_new > max_velocity:
-                    u_new[i, j] = u_new[i, j] * max_velocity / vel_mag_new
-                    v_new[i, j] = v_new[i, j] * max_velocity / vel_mag_new
-            else:
-                # No water or too shallow - zero velocity
-                u_new[i, j] = 0.0
-                v_new[i, j] = 0.0
-    
-    # Mass conservation with improved stability
-    for i in range(1, nx-1):
-        for j in range(1, ny-1):
-            # Calculate fluxes using upwind scheme for better stability
-            qx_east = max(0, -u_new[i, j]) * h[i, j+1] + max(0, u_new[i, j]) * h[i, j]
-            qx_west = max(0, u_new[i, j-1]) * h[i, j-1] + max(0, -u_new[i, j-1]) * h[i, j]
-            
-            qy_north = max(0, -v_new[i, j]) * h[i+1, j] + max(0, v_new[i, j]) * h[i, j]
-            qy_south = max(0, v_new[i-1, j]) * h[i-1, j] + max(0, -v_new[i-1, j]) * h[i, j]
-            
-            # Limit fluxes
-            qx_east = max(min(qx_east, max_flux), -max_flux)
-            qx_west = max(min(qx_west, max_flux), -max_flux)
-            qy_north = max(min(qy_north, max_flux), -max_flux)
-            qy_south = max(min(qy_south, max_flux), -max_flux)
-            
-            # Calculate divergence
-            dqx = (qx_east - qx_west) / dx
-            dqy = (qy_north - qy_south) / dy
-            
-            # Update water depth (Continuity Eqn and Forward Euler)
-            dh_dt = -(dqx + dqy)
-            h_new[i, j] = max(h[i, j] + dt * dh_dt, 0.0)
-            
-            # Apply a small diffusion to prevent grid artifacts
-            if i > 1 and i < nx-2 and j > 1 and j < ny-2:
-                h_avg = (h[i-1, j] + h[i+1, j] + h[i, j-1] + h[i, j+1]) / 4.0
-                h_new[i, j] = 0.95 * h_new[i, j] + 0.05 * h_avg
-    
-    return h_new, u_new, v_new
-
 
 class FloodSimulation:
-    def __init__(self, dem, dx=1.0, dy=1.0, g=9.81, manning=0.03, 
-                 adaptive_timestep=True, stability_factor=0.15, max_velocity=5.0,
-                 use_numba=True):
+    def __init__(self, dem, valid_mask, 
+                dx=1.0, dy=1.0, g=9.81, 
+                manning=0.03, infiltration_rate=0.0, adaptive_timestep=True,
+                stability_factor=0.4, max_velocity=10.0, min_depth=0.001,
+                outlet_threshold_percentile=5.0):
         """
-        Initialize the improved flood simulation with better stability parameters
-        
-        Parameters:
-        -----------
-        dem : numpy.ndarray
-            Digital Elevation Model (2D array of elevation values)
-        dx, dy : float
-            Grid cell size in x and y directions
-        g : float
-            Acceleration due to gravity
-        manning : float
-            Manning's roughness coefficient
-        adaptive_timestep : bool
-            Whether to use adaptive timestep to maintain stability
-        stability_factor : float
-            Factor to reduce timestep (0-1) for stability control (reduced from original)
-        max_velocity : float
-            Maximum allowed velocity (m/s) for stability control (reduced from original)
-        """
-        self.dem = dem
-        self.dx = dx
-        self.dy = dy
-        self.g = g
-        self.manning = manning
-        self.adaptive_timestep = adaptive_timestep
-        self.stability_factor = stability_factor
-        self.max_velocity = max_velocity
-        
-        # Initialize water depth, velocities
-        self.h = np.zeros_like(dem)
-        self.u = np.zeros_like(dem)  # x-velocity
-        self.v = np.zeros_like(dem)  # y-velocity
-        
-        # Calculate grid dimensions
-        self.nx, self.ny = dem.shape
-        
-        # Compute timestep based on grid size (more conservative CFL condition)
-        self.dt = 0.05 * min(dx, dy) / np.sqrt(g * np.max(dem) + 1e-6)
-        self.original_dt = self.dt  # Store the original timestep for adaptive control
+        Initialize the flood simulation using the DEM data 
 
-        # Track maximum flood extent and depth
-        self.max_flood_extent = np.zeros_like(dem, dtype=bool)
-        self.max_flood_depth = np.zeros_like(dem)
+        Parameters:
+        dem : numpy.ndarray : Digital Elevation Model (2D array of elevation values)
+        valid_mask : numpy.ndarray : Mask indicating valid areas for simulation 
+        dx, dy : float : Grid cell size in x and y directions
+        g : float : Acceleration due to gravity
+        manning : float : Manning's roughness coefficient
+        infiltration_rate : float : Rate of infiltration (m/s)
+        adaptive_timestep : bool : Whether to use adaptive timestep to maintain stability
+        stability_factor : float : Factor to reduce timestep (0-1) for stability control 
+        max_velocity : float : Maximum allowed velocity (m/s) for stability control 
+        outlet_threshold_percentile : float : Percentile for outlet detection (0-100)
+        """
+
+        # Store DEM and the valid mask
+        self.dem = dem.astype(np.float64)
+        self.valid_mask = valid_mask.astype(bool)
+
+        #Initialize parameters
+        self.dx = float(dx)
+        self.dy = float(dy)
+        self.g = float(g)
+        self.manning = float(manning)
+        self.infiltration_rate = float(infiltration_rate)
+        self.adaptive_timestep = adaptive_timestep
+        self.stability_factor = float(stability_factor)
+        self.max_velocity = float(max_velocity)
+        self.min_depth = float(min_depth)
+        self.min_depth = float(min_depth)
+
+        # Generate boundary mask based on DEM and valid_mask 
+        self.boundary_mask = generate_boundary_mask(self.dem, self.valid_mask, outlet_threshold_percentile)
+
+        # Initialize SWE variable arrays 
+        self.h = np.zeros_like(self.dem, dtype=np.float64)
+        self.u = np.zeros_like(self.dem, dtype=np.float64)
+        self.v = np.zeros_like(self.dem, dtype=np.float64)
+        self.nx, self.ny = self.dem.shape
+
+        # Zeroing the water depth in invalid areas since the velecities are already zeroed 
+        self.h[~self.valid_mask] = 0.0
+
+        # Initial timestep guess (use stats only from valid areas)
+        if np.any(self.valid_mask):
+            max_h_guess = max(1.0, np.nanmax(dem[self.valid_mask]) - np.nanmin(dem[self.valid_mask]))
+        else: 
+            max_h_guess = 1.0 # Default if no valid cells
+
+        # Compute timestep based on grid size (CFL step initialization)
+        self.dt = 0.1 * min(dx, dy) / np.sqrt (g * max_h_guess + 1e-6)
+        self.original_dt_guess = self.dt
+
+        # For debugging purposes, print the initial dt guess
+        print(f"Initial dt guess: {self.dt:.4f} s")
+
+        self.sources = []
+        self.rainfall = None
+        self.current_step = 0
+
+        self.max_flood_extent = np.zeros_like(self.dem, dtype=bool)
+        self.max_flood_depth = np.zeros_like(self.dem)
         
-        # Performance tracking
-        self.computation_times = []
+        # Ensure max trackers not set outside valid area
+        self.max_flood_depth[~self.valid_mask] = np.nan 
 
     def add_water_source(self, row, col, rate, duration=None):
         """Add a water source at a specific location"""
