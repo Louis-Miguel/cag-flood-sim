@@ -64,10 +64,9 @@ pip install numpy scipy matplotlib numba
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
+    git clone https://github.com/Louis-Miguel/cag-flood-sim
+    cd cag-flood-sim
     ```
-    (Replace `your-username/your-repo-name` with the actual URL)
 
 2.  **Install dependencies:** (Create a `requirements.txt` file first)
     ```bash
@@ -106,17 +105,7 @@ python flood_simulation_driver.py -h
 
 1.  **Run simulation on a GeoTIFF, specify grid size, add rain, save as MP4:**
     ```bash
-    python flood_simulation_driver.py ./data/my_dem.tif --dx 10 --dy 10 --rain-rate-mmhr 40 --rain-duration 500 --manning 0.045 --steps 1000 -o output/flood_rain.mp4
-    ```
-
-2.  **Run on ASCII grid, fill sinks, add point source, higher output frequency:**
-    ```bash
-    python flood_simulation_driver.py /path/to/dem.asc --dx_default 25 --dy_default 25 --fill-sinks --source-row 150 --source-col 200 --source-rate 15 --steps 800 --output-freq 5 -o output/flood_source.gif
-    ```
-
-3.  **Run on NumPy DEM, specify NoData value, disable outlets:**
-    ```bash
-    python flood_simulation_driver.py arrays/prepared_dem.npy --dx 5 --dy 5 --nodata-value -9999 --outlet-percentile 100 --steps 400
+    python flood_simulation_driver.py ./data/my_dem.tif --dx 10 --dy 10 --rain-rate 40 --rain-duration 500 --manning 0.045 --steps 1000 -o output/flood_rain.mp4
     ```
 ## File Structure
 
