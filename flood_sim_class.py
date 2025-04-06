@@ -5,13 +5,14 @@ from matplotlib import animation
 from scipy.ndimage import gaussian_filter
 from matplotlib.colors import LightSource, Normalize
 from flood_tools import generate_boundary_mask 
+from compute_flood_step import compute_step
 
 class FloodSimulation:
     def __init__(self, dem, valid_mask, 
                 dx=1.0, dy=1.0, g=9.81, 
                 manning=0.03, infiltration_rate=0.0, adaptive_timestep=True,
                 stability_factor=0.4, max_velocity=10.0, min_depth=0.001,
-                outlet_threshold_percentile=5.0):
+                outlet_threshold_percentile=5.0, target_time=3600.0):
         """
         Initialize the flood simulation using the DEM data 
 
@@ -27,6 +28,7 @@ class FloodSimulation:
         stability_factor : float : Factor to reduce timestep (0-1) for stability control 
         max_velocity : float : Maximum allowed velocity (m/s) for stability control 
         outlet_threshold_percentile : float : Percentile for outlet detection (0-100)
+        target_time : float : Target simulation time (seconds)
         """
 
         # Store DEM and the valid mask
@@ -43,7 +45,8 @@ class FloodSimulation:
         self.stability_factor = float(stability_factor)
         self.max_velocity = float(max_velocity)
         self.min_depth = float(min_depth)
-        self.min_depth = float(min_depth)
+        self.target_time = float(target_time)
+
 
         # Generate boundary mask based on DEM and valid_mask
         self.boundary_mask = generate_boundary_mask(self.dem, self.valid_mask, outlet_threshold_percentile)
@@ -152,7 +155,7 @@ class FloodSimulation:
         if self.rainfall:
             if self.rainfall['duration'] is None or self.rainfall['steps_active'] < self.rainfall['duration']:
                 time_factor = self.rainfall['time_pattern'](self.rainfall['steps_active'], self.rainfall['duration'])
-                effective_rate = self.rainfall['base_rate'] * time_factor
+                effective_rate = self.rainfall['rate'] * time_factor
                 rainfall_depth = effective_rate * self.dt * self.rainfall['distribution']
                 h_new += np.maximum(0.0, rainfall_depth) 
                 self.rainfall['steps_active'] += 1
@@ -190,7 +193,7 @@ class FloodSimulation:
                 self.dt = 1e-9
 
         # Call numba function
-        h_new, u_new, v_new = compute_step_jit(
+        h_new, u_new, v_new = compute_step(
             self.h, self.u, self.v, self.dem, self.boundary_mask, # Pass mask
             self.g, self.manning, self.dx, self.dy, self.dt,
             self.infiltration_rate, self.min_depth
@@ -271,14 +274,17 @@ class FloodSimulation:
                 print(
                     f"Step {step}/{num_steps - 1}, "
                     f"Sim Time: {total_time:.3f}s, "
-                    f"dt: {self.dt:.4f}s, "
-                    f"Max Depth: {max_depth:.3f}m, "
-                    f"Max Vel: {max_vel:.3f}m/s, "
-                    f"Area: {flood_area:.1f}m², "
+                    f"dt: {self.dt:.5f}s, "
+                    f"Max Depth: {max_depth:.10f}m, "
+                    f"Max Vel: {max_vel:.10f}m/s, "
+                    f"Area: {flood_area:.10f}m², "
                     f"Vol: {flood_volume:.1f}m³"
                 )
                 if not np.isfinite(max_depth) or max_depth > 1000:
                     print(" Warning: Simulation may be unstable. Stopping.")
+                    break
+                if total_time > self.target_time:
+                    print(f" Simulation time reached target time {self.target_time}. Stopping.")
                     break
 
         end_run_time = time.time()
@@ -291,11 +297,11 @@ class FloodSimulation:
         return results, time_steps_list
 
     def visualize_results(self, results, time_steps, output_path=None,
-                        show_animation=True, save_last_frame=True,
-                        hillshade=True, contour_levels=10):
+                            show_animation=True, save_last_frame=True,
+                            hillshade=True, contour_levels=10):
         """
         Visualize the simulation results with enhanced terrain visualization.
-        Handles potential issues with empty or NaN results.
+        Handles potential issues with empty or NaN results and large DEMs.
 
         Parameters:
         -----------
@@ -312,95 +318,186 @@ class FloodSimulation:
             print("No results to visualize.")
             return None
 
-        fig, ax = plt.subplots(figsize=(10, 8))
+        # Increase figure size slightly for potentially large aspect ratios
+        fig, ax = plt.subplots(figsize=(12, 10)) # Consider adjusting figsize based on aspect ratio?
 
-        # Determine color limits for water depth (Robust calculation) 
+        # Valid Mask Check (Keep for debugging if needed, comment out for speed) 
+        # plt.figure("Valid Mask Check")
+        # plt.imshow(self.valid_mask, interpolation='none', origin='upper') 
+        # plt.title("Loaded Valid Mask")
+        # plt.show(block=False)
+        # 
+
+        # Determine Color Limits for Water Depth 
         valid_maxes = []
-        for h in results:
-            # Consider only valid area for max depth calculation
+        print("Calculating max water depth for color bar...")
+        for idx, h in enumerate(results):
             if h is not None and h.size > 0 and self.valid_mask.shape == h.shape:
-                try:
-                    max_val = np.nanmax(h[self.valid_mask]) 
-                    if np.isfinite(max_val): valid_maxes.append(max_val)
-                except Exception: pass 
+                if np.any(self.valid_mask): 
+                    try:
+                        max_val = np.nanmax(h[self.valid_mask])
+                        if np.isfinite(max_val):
+                            valid_maxes.append(max_val)
+                    except ValueError: # 
+                        print(f"Warning: Could not process frame {idx} for vmax calculation.")
+                        pass 
+                # If no valid mask, max depth is effectively 0, handled by vmax defaulting below
 
-
-        vmax = max(valid_maxes) if valid_maxes else 1.0
-        if vmax < self.min_depth: vmax = self.min_depth * 10
-        if np.isnan(vmax): vmax = 1.0
-        norm = Normalize(vmin=0, vmax=vmax)
-        
-        # Plotting DEM background (mask invalid areas if desired)
-        dem_display = self.dem.copy()
-        dem_display[~self.valid_mask] = np.nan # Mask DEM for display
-
-        if hillshade:
-            ls = LightSource(azdeg=315, altdeg=45)
-            
-            # Calculate normalization only on valid DEM parts
-            dem_min_valid = np.nanmin(dem_display)
-            dem_max_valid = np.nanmax(dem_display)
-
-            if dem_max_valid > dem_min_valid:
-                # Create norm array, keeping NaNs
-                dem_norm_val = (dem_display - dem_min_valid) / (dem_max_valid - dem_min_valid)
-            else: # Handle flat valid terrain
-                dem_norm_val = np.full_like(dem_display, 0.5)
-                dem_norm_val[~self.valid_mask] = np.nan # Keep NaNs
-
-            # Shade
-            rgb = ls.shade(dem_norm_val, cmap=plt.cm.terrain, vert_exag=1.0, blend_mode='soft')
-            
-            # Set NaN areas in RGB to background color (e.g., transparent or specific color)
-            dem_plot = ax.imshow(rgb, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+        if valid_maxes:
+            vmax = max(valid_maxes)
         else:
-            # Use a colormap that handles NaN 
-            terrain_cmap = plt.cm.terrain
-            terrain_cmap.set_bad(color='none') 
+            print("Warning: No valid finite water depths found. Using default vmax=1.0.")
+            vmax = 1.0
 
-            dem_plot = ax.imshow(dem_display, cmap=terrain_cmap, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
-            
+        # Ensure vmax is slightly above min_depth for visual clarity if depths are very low
+        if vmax <= self.min_depth:
+             vmax = self.min_depth * 5 
 
-        # Add contour lines 
+        # Final check if something went wrong
+        if np.isnan(vmax): 
+            print("Warning: Calculated vmax is NaN. Defaulting to 1.0.")
+            vmax = 1.0
+        print(f"Water depth color bar max (vmax): {vmax:.3f}")
+        # Define normalization for water
+        norm = Normalize(vmin=0, vmax=vmax) 
+
+        # Prepare DEM for Display 
+        dem_display = self.dem.copy()
+        dem_display[~self.valid_mask] = np.nan
+
+        # Plot DEM Background 
+        print("Plotting DEM background...")
+        if hillshade:
+            try:
+                ls = LightSource(azdeg=315, altdeg=45)
+                # Calculate normalization ONLY on valid DEM parts
+                dem_min_valid = np.nanmin(dem_display)
+                dem_max_valid = np.nanmax(dem_display)
+
+                # Handle cases: all NaN, flat terrain, normal terrain
+                if np.isnan(dem_min_valid) or np.isnan(dem_max_valid):
+                    print("Warning: DEM display has no valid data for hillshade normalization.")
+                    # Create a fully NaN normalized array if no valid data
+                    dem_norm_val = np.full_like(dem_display, np.nan)
+                elif dem_max_valid <= dem_min_valid: # Handle flat valid terrain
+                    print("Warning: DEM display has flat valid terrain for hillshade.")
+                    dem_norm_val = np.full_like(dem_display, 0.5) 
+                    dem_norm_val[~self.valid_mask] = np.nan      
+                else:
+                    # Normalize valid data, NaNs remain NaN
+                    dem_norm_val = (dem_display - dem_min_valid) / (dem_max_valid - dem_min_valid)
+
+                # Fast NaN Filling for Shading 
+                # Create a temporary array JUST for the shading function
+                dem_for_shade = dem_norm_val 
+                fill_value = 0.5 
+
+                # Check if NaNs actually exist *before* creating the mask and filling
+                nan_mask = ~np.isfinite(dem_for_shade)
+                if np.any(nan_mask):
+                    print(f"Filling ~{np.sum(nan_mask)} NaN values with {fill_value} for hillshading...")
+                    dem_for_shade[nan_mask] = fill_value 
+                
+
+                # Perform shading 
+                print("Performing hillshading calculation...")
+                rgb = ls.shade(dem_for_shade, cmap=plt.cm.terrain, vert_exag=1.0, blend_mode='soft')
+                print("Hillshading calculation complete.")
+
+                # Convert shaded result (likely 0-1 float) to RGBA uint8 image
+                if rgb.ndim == 3 and rgb.shape[2] >= 3:
+                    # Create RGBA array, ensure correct dtype (uint8 for imshow RGBA)
+                    rgba = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
+                    # Convert float RGB [0,1] to uint8 [0,255]
+                    rgba[:, :, :3] = np.clip(rgb[:, :, :3] * 255, 0, 255).astype(np.uint8)
+                    rgba[:, :, 3] = 255 
+
+                    # Apply transparency using the ORIGINAL valid_mask
+                    rgba[~self.valid_mask, 3] = 0 # Set alpha to 0 (transparent) outside
+                else:
+                    print("Warning: Hillshade output was not in expected RGB format. Skipping terrain plot.")
+                    # Fallback to non-hillshade path
+                    hillshade = False 
+
+                # Display the RGBA image
+                if hillshade: # Check if we are still on hillshade path
+                    dem_plot = ax.imshow(rgba, extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
+                                    origin='upper', interpolation='nearest')
+
+            except Exception as e_shade:
+                print(f"ERROR during hillshading: {e_shade}")
+                print("Falling back to non-hillshaded terrain display.")
+                hillshade = False 
+
+        # Non-Hillshade Path (or fallback from failed hillshade)
+        if not hillshade:
+            terrain_cmap = plt.cm.terrain.copy() 
+            terrain_cmap.set_bad(color='white', alpha=0) 
+
+            terrain_vmin = np.nanmin(dem_display)
+            terrain_vmax = np.nanmax(dem_display)
+            if np.isnan(terrain_vmin) or np.isnan(terrain_vmax): terrain_vmin, terrain_vmax = 0, 1
+
+            dem_plot = ax.imshow(dem_display, cmap=terrain_cmap,
+                                vmin=terrain_vmin, vmax=terrain_vmax,
+                                extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
+                                origin='upper', interpolation='nearest') 
+            # Optional colorbar for elevation when not hillshading
+            plt.colorbar(dem_plot, ax=ax, label='Elevation (m)', shrink=0.7)
+
+        print("DEM background plotted.")
+
+        # Add Contour Lines 
         if contour_levels > 0:
-            ax.contour(dem_display, colors='black', alpha=0.3, levels=contour_levels,
-                    linewidths=0.5, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+            print(f"Adding {contour_levels} contour lines...")
+            try:
+                ax.contour(dem_display, colors='black', alpha=0.3, levels=contour_levels,
+                        linewidths=0.5, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
+            except Exception as e_contour:
+                print(f"Warning: Could not draw contours. {e_contour}")
+            print("Contours added.")
 
-        # Water visualization 
-        water_cmap = plt.cm.Blues
+        # Water Visualization Setup 
+        print("Setting up water layer...")
+        water_cmap = plt.cm.Blues.copy() 
         water_cmap.set_bad('none') 
 
+        # Prepare the initial frame
         first_frame = results[0]
         if first_frame is not None and first_frame.size > 0:
-            # Mask outside area OR where depth is below minimum
             mask = ~self.valid_mask | (first_frame <= self.min_depth)
             masked_water = np.ma.masked_where(mask, first_frame)
         else:
-            masked_water = np.ma.masked_array(np.zeros_like(self.dem), mask=True) # Empty
+            # Create an empty masked array if first frame is bad
+            masked_water = np.ma.masked_array(np.zeros_like(self.dem), mask=True)
 
-        water_plot = ax.imshow(masked_water, cmap=water_cmap, norm=norm, alpha=0.7, 
-                            extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper', interpolation='none')
+        water_plot = ax.imshow(masked_water, cmap=water_cmap, norm=norm, alpha=0.7,
+                            extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
+                            origin='upper', interpolation='nearest') 
 
         # Add colorbar for water depth
         cbar = plt.colorbar(water_plot, ax=ax, pad=0.01, label='Water Depth (m)', shrink=0.7)
 
-        # Add water source markers
+        # Add water source markers 
         source_labels = []
         for i, source in enumerate(self.sources):
-            x = (source['col'] + 0.5) * self.dx
-            y = (self.nx - 1 - source['row'] + 0.5) * self.dy
-            handle = ax.plot(x, y, 'ro', markersize=8, label=f'Source {i+1}')
-            source_labels.append(handle[0])
+            if self.valid_mask[source['row'], source['col']]:
+                x = (source['col'] + 0.5) * self.dx
+                # Correct y coordinate calculation for origin='upper'
+                y = (source['row'] + 0.5) * self.dy 
+                handle = ax.plot(x, y, 'ro', markersize=8, markeredgecolor='k', label=f'Source {i+1}')
+                source_labels.append(handle[0])
         if source_labels:
             ax.legend(handles=source_labels, loc='upper right')
 
-        # Add title and labels
+        # Add Title and Labels 
         title = ax.set_title(f'Flood Simulation (Time: {time_steps[0]:.2f} s)')
         ax.set_xlabel("X distance (m)")
         ax.set_ylabel("Y distance (m)")
-        ax.invert_yaxis()
 
-        # Animation update function
+        print("Initial frame plotted.")
+
+        # Animation Update Function 
         def update(frame_idx):
             frame_data = results[frame_idx]
             if frame_data is not None and frame_data.size > 0:
@@ -408,63 +505,76 @@ class FloodSimulation:
                 masked_water_update = np.ma.masked_where(mask_update, frame_data)
                 water_plot.set_array(masked_water_update)
             else:
-                water_plot.set_array(np.ma.masked_array(np.zeros_like(self.dem), mask=True)) # Empty
+                water_plot.set_array(np.ma.masked_array(np.zeros_like(self.dem), mask=True))
 
             title.set_text(f'Flood Simulation (Time: {time_steps[frame_idx]:.2f} s)')
+            # Return list of artists changed for blitting
+            # If blit=False, returning isn't strictly necessary but good practice
             return [water_plot, title]
 
-        # Create animation
+        # Create Animation 
+        print("Creating animation object...")
+        # blit=False first for a better initial frame rendering
+        use_blit = False
         anim = animation.FuncAnimation(
             fig, update, frames=len(results),
-            interval=150, blit=True, repeat=False
+            interval=150, blit=use_blit, repeat=False
         )
+        print("Animation object created.")
 
-        # Save animation if requested
+        # Save Animation 
         if output_path:
-            try:
-                writer_name = None
-                if output_path.endswith('.gif'):
-                    writer_name = 'pillow'
-                elif output_path.endswith('.mp4'):
-                    writer_name = 'ffmpeg'
-                else:
-                    print("Warning: Unknown animation format. Attempting to save as GIF.")
-                    output_path = output_path.rsplit('.', 1)[0] + '.gif'
-                    writer_name = 'pillow'
+            writer_name = None
+            if output_path.endswith('.gif'): writer_name = 'pillow'
+            elif output_path.endswith('.mp4'): writer_name = 'ffmpeg'
+            else: print("Warning: Unknown animation format. Defaulting to GIF."); output_path += ".gif"; writer_name = 'pillow'
 
-                if writer_name:
-                    print(f"Saving animation to {output_path} (using {writer_name})... this may take a while.")
-                    anim.save(output_path, writer=writer_name, fps=10, dpi=150)
+            if writer_name:
+                print(f"Saving animation to {output_path} (using {writer_name})... this may take a while...")
+                # Reduce DPI slightly for potentially faster saving on large figs
+                save_dpi = 120
+                try:
+                    anim.save(output_path, writer=writer_name, fps=10, dpi=save_dpi)
                     print("Animation saved.")
-            except Exception as e:
-                print(f"Error saving animation: {e}")
-                print("Ensure required libraries (e.g., pillow, ffmpeg) are installed and accessible.")
+                except Exception as e_save:
+                    print(f"ERROR saving animation: {e_save}")
+                    print("Ensure required libraries (pillow for GIF, ffmpeg for MP4) are installed.")
 
-        # Save last frame if requested
+        # Save Last Frame 
         if save_last_frame and output_path:
-            try:
-                # Update plot to the last valid frame before saving
-                last_valid_frame_idx = len(results) - 1 
-                
-                if last_valid_frame_idx >= 0:
-                    update(last_valid_frame_idx) 
-                    last_frame_path = output_path.rsplit('.', 1)[0] + '_final_frame.png'
-                    plt.savefig(last_frame_path, dpi=300, bbox_inches='tight')
-                    print(f"Final frame saved to {last_frame_path}")
-                else:
-                    print("Could not save last frame: No valid result frames found.")
-            except Exception as e:
-                print(f"Error saving final frame: {e}")
+            last_valid_frame_idx = -1
+            # Find last valid frame index (simple linear scan from end)
+            for i in range(len(results) - 1, -1, -1):
+                if results[i] is not None and results[i].size > 0:
+                    last_valid_frame_idx = i
+                    break
 
-        # Show animation if requested
+            if last_valid_frame_idx >= 0:
+                print("Generating final frame...")
+                update(last_valid_frame_idx) 
+                last_frame_path = output_path.rsplit('.', 1)[0] + '_final_frame.png'
+                try:
+                    plt.savefig(last_frame_path, dpi=200, bbox_inches='tight') 
+                    print(f"Final frame saved to {last_frame_path}")
+                except Exception as e_frame:
+                    print(f"Error saving final frame: {e_frame}")
+            else:
+                print("Could not save last frame: No valid result frames found.")
+
+        # Show Animation 
         if show_animation:
+            print("Displaying animation window...")
             plt.tight_layout()
             try:
-                plt.show()
-            except Exception as e:
-                print(f"Could not display animation interactively: {e}")
-                plt.close(fig) 
+                plt.show() 
+            except Exception as e_show:
+                print(f"Could not display animation interactively: {e_show}")
+                # Closes the figure if plt.show failed mid-way
+                try: plt.close(fig)
+                except Exception: pass
         else:
-            plt.close(fig) 
+            # Close the figure immediately if not showing interactively
+            plt.close(fig)
 
-        return anim
+        print("Visualization finished.")
+        return anim 
