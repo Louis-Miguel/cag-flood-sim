@@ -78,9 +78,9 @@ def flood_simulation_driver(args):
 
     #  Convert Units 
     # Infiltration rate from mm/hr to m/s
-    infiltration_rate_ms = args.infiltration_mmhr / (1000.0 * 3600.0) if args.infiltration_mmhr else 0.0
+    infiltration_rate_ms = args.infiltration_rate / (1000.0 * 3600.0) if args.infiltration_rate else 0.0
     # Rainfall rate from mm/hr to m/s
-    rain_rate_ms = args.rain_rate_mmhr / (1000.0 * 3600.0) if args.rain_rate_mmhr else 0.0
+    rain_rate_ms = args.rain_rate / (1000.0 * 3600.0) if args.rain_rate else 0.0
 
     # Initialize Simulation 
     print("Initializing simulation...")
@@ -131,7 +131,7 @@ def flood_simulation_driver(args):
 
     # Rainfall
     if rain_rate_ms > 0:
-        print(f"Adding rainfall rate: {args.rain_rate_mmhr} mm/hr")
+        print(f"Adding rainfall rate: {args.rain_rate} mm/hr")
         sim.add_rainfall(
             rate=rain_rate_ms,
             duration_steps=args.rain_duration # Pass None if not specified
