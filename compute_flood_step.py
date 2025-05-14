@@ -4,7 +4,7 @@ import numpy as np
 @numba.jit(nopython=True, cache=True) # Numba decorator for JIT compilation (Faster Python)
 def compute_step(h, u, v, dem, boundary_mask, 
                     g, manning, dx, dy, dt,
-                    infiltration_rate, min_depth=0.001):
+                    infiltration_rate, min_depth=0.001, max_velocity_param=10.0):
     """
     Performs one step of the shallow water simulation using RK2, Upwinding,
     and boundary conditions applied via ghost cells based on boundary_mask.
@@ -25,6 +25,7 @@ def compute_step(h, u, v, dem, boundary_mask,
     dt : float : Time step size (s)
     infiltration_rate : float : Rate of infiltration (m/s)
     min_depth : float : Minimum depth for velocity calculation (m)
+    max_velocity_param : float : Maximum velocity parameter for clipping (m/s)
     """
     # Initialization of dimensions
     nx_int, ny_int = dem.shape 
@@ -34,7 +35,7 @@ def compute_step(h, u, v, dem, boundary_mask,
     h_pad = np.zeros((nx_pad, ny_pad), dtype=h.dtype)
     u_pad = np.zeros((nx_pad, ny_pad), dtype=u.dtype)
     v_pad = np.zeros((nx_pad, ny_pad), dtype=v.dtype)
-    dem_pad = np.zeros((nx_pad, ny_pad), dtype=dem.dtype) # Pad DEM too
+    dem_pad = np.zeros((nx_pad, ny_pad), dtype=dem.dtype) 
     eta_pad = np.zeros((nx_pad, ny_pad), dtype=dem.dtype)
 
     #  Fill Padded Arrays - Stage 1: Interior and Ghost Cell Filling (Current State
@@ -56,58 +57,70 @@ def compute_step(h, u, v, dem, boundary_mask,
     dem_pad[-1, -1] = dem_pad[-2, -2]
 
     # Fill ghost cells based on boundary_mask and *local orientation*
-    for i in range(nx_pad):
-        for j in range(ny_pad):
-            # Skip if it's an interior cell (no need to fill ghost values)
-            if 1 <= i < nx_pad - 1 and 1 <= j < ny_pad - 1:
+    for i_ghost in range(nx_pad):
+        for j_ghost in range(ny_pad):
+            # Skip if it's an interior cell (no need to fill ghost values here)
+            if 1 <= i_ghost < nx_pad - 1 and 1 <= j_ghost < ny_pad - 1:
                 continue
 
             # Determine coordinates of the adjacent interior cell
-            i_int_neighbor = min(max(0, i - 1), nx_int - 1) # Row index of the valid neighbor
-            j_int_neighbor = min(max(0, j - 1), ny_int - 1) # Col index of the valid neighbor
+            if i_ghost == 0: 
+                i_int_neighbor = 0
+            elif i_ghost == nx_pad - 1: 
+                i_int_neighbor = nx_int - 1
+            else: 
+                i_int_neighbor = i_ghost - 1
+
+            if j_ghost == 0: 
+                j_int_neighbor = 0
+            elif j_ghost == ny_pad - 1: 
+                j_int_neighbor = ny_int - 1
+            else: 
+                j_int_neighbor = j_ghost - 1
 
             # Get the boundary condition type FROM the adjacent interior cell
             bc_type = boundary_mask[i_int_neighbor, j_int_neighbor]
 
-            # Get state values from the adjacent interior cell
-            h_neighbor = h[i_int_neighbor, j_int_neighbor]
-            u_neighbor = u[i_int_neighbor, j_int_neighbor]
-            v_neighbor = v[i_int_neighbor, j_int_neighbor]
+            # Get state values from this adjacent interior cell
+            h_neighbor_val = h[i_int_neighbor, j_int_neighbor]
+            u_neighbor_val = u[i_int_neighbor, j_int_neighbor]
+            v_neighbor_val = v[i_int_neighbor, j_int_neighbor]
 
-            # Apply Boundary Conditions based on bc_type and RELATIVE POSITION
-            if bc_type == 1: # Closed Wall
-                h_pad[i, j] = h_neighbor 
+            # Apply Boundary Conditions based on bc_type and RELATIVE POSITION of ghost to interior
+            if bc_type == 1: # Closed Wall defined by (i_int_neighbor, j_int_neighbor)
+                h_pad[i_ghost, j_ghost] = h_neighbor_val
 
-                # Determine relative position to apply correct reflection
-                # i_int_pad, j_int_pad are the coordinates of the neighbor in the padded array
-                i_int_pad = i_int_neighbor + 1
-                j_int_pad = j_int_neighbor + 1
+                # Determine relative position of ghost (i_ghost, j_ghost) to its interior neighbor cell
+                i_int_pad_coord = i_int_neighbor + 1
+                j_int_pad_coord = j_int_neighbor + 1
 
-                if i == i_int_pad and (j == j_int_pad - 1 or j == j_int_pad + 1):
-                    # Reflect U (normal velocity), copy V (tangential)
-                    u_pad[i, j] = -u_neighbor
-                    v_pad[i, j] = v_neighbor
-                elif j == j_int_pad and (i == i_int_pad - 1 or i == i_int_pad + 1):
-                    # Reflect V (normal velocity), copy U (tangential)
-                    u_pad[i, j] = u_neighbor
-                    v_pad[i, j] = -v_neighbor
-                elif abs(i - i_int_pad) == 1 and abs(j - j_int_pad) == 1:
-                    # Reflect both (simple corner handling, prevents flow)
-                    u_pad[i, j] = -u_neighbor
-                    v_pad[i, j] = -v_neighbor
-                else:
-                    u_pad[i, j] = u_neighbor
-                    v_pad[i, j] = v_neighbor
+                # Ghost is to the left (j_ghost < j_int_pad_coord) or right (j_ghost > j_int_pad_coord) of interior cell
+                if i_ghost == i_int_pad_coord and (j_ghost == j_int_pad_coord - 1 or j_ghost == j_int_pad_coord + 1):
+                    u_pad[i_ghost, j_ghost] = -u_neighbor_val # Reflect U (normal velocity)
+                    v_pad[i_ghost, j_ghost] =  v_neighbor_val # Copy V (tangential)
+                # Ghost is above (i_ghost < i_int_pad_coord) or below (i_ghost > i_int_pad_coord) of interior cell
+                elif j_ghost == j_int_pad_coord and (i_ghost == i_int_pad_coord - 1 or i_ghost == i_int_pad_coord + 1):
+                    u_pad[i_ghost, j_ghost] =  u_neighbor_val # Copy U (tangential)
+                    v_pad[i_ghost, j_ghost] = -v_neighbor_val # Reflect V (normal velocity)
+                # Corner ghost cells
+                elif abs(i_ghost - i_int_pad_coord) == 1 and abs(j_ghost - j_int_pad_coord) == 1:
+                    # Reflect both U and V (simplest corner handling for wall)
+                    u_pad[i_ghost, j_ghost] = -u_neighbor_val
+                    v_pad[i_ghost, j_ghost] = -v_neighbor_val
+                else: 
+                    u_pad[i_ghost, j_ghost] = u_neighbor_val
+                    v_pad[i_ghost, j_ghost] = v_neighbor_val
 
-            elif bc_type == 2: # Open Outlet (Zero Gradient)
-                h_pad[i, j] = h_neighbor
-                u_pad[i, j] = u_neighbor
-                v_pad[i, j] = v_neighbor
 
-            else: 
-                h_pad[i, j] = h_neighbor
-                u_pad[i, j] = u_neighbor
-                v_pad[i, j] = v_neighbor
+            elif bc_type == 2: # Open Outlet (Zero Gradient for h, u, v)
+                h_pad[i_ghost, j_ghost] = h_neighbor_val
+                u_pad[i_ghost, j_ghost] = u_neighbor_val
+                v_pad[i_ghost, j_ghost] = v_neighbor_val
+            
+            else:
+                h_pad[i_ghost, j_ghost] = h_neighbor_val
+                u_pad[i_ghost, j_ghost] = u_neighbor_val
+                v_pad[i_ghost, j_ghost] = v_neighbor_val
 
 
     # Calculate padded eta using the filled h_pad and padded dem_pad
@@ -158,32 +171,29 @@ def compute_step(h, u, v, dem, boundary_mask,
     dv_dt = -adv_u_dvdx - adv_v_dvdy - g * detady - friction_v
 
     # Continuity (Flux divergence using interior h, u, v for fluxes)
-    qx = h * u 
-    qy = h * v
+    qx_on_padded_grid = h_pad * u_pad
+    qy_on_padded_grid = h_pad * v_pad
     
-    # Pad fluxes for continuity calculation (using padded arrays) (Same scheme as above)
-    qx_pad_flux = np.zeros((nx_pad, ny_pad), dtype=qx.dtype)
-    qx_pad_flux[1:-1, 1:-1] = qx
-    qx_pad_flux[0, :] = qx_pad_flux[1, :]
-    qx_pad_flux[-1, :] = qx_pad_flux[-2, :]
-    qx_pad_flux[:, 0] = qx_pad_flux[:, 1]
-    qx_pad_flux[:, -1] = qx_pad_flux[:, -2]
-    
-    qy_pad_flux = np.zeros((nx_pad, ny_pad), dtype=qy.dtype)
-    qy_pad_flux[1:-1, 1:-1] = qy
-    qy_pad_flux[0, :] = qy_pad_flux[1, :]
-    qy_pad_flux[-1, :] = qy_pad_flux[-2, :]
-    qy_pad_flux[:, 0] = qy_pad_flux[:, 1]
-    qy_pad_flux[:, -1] = qy_pad_flux[:, -2]
-
-    dqx_dx = (qx_pad_flux[1:-1, 2:] - qx_pad_flux[1:-1, :-2]) / (2 * dx)
-    dqy_dy = (qy_pad_flux[2:, 1:-1] - qy_pad_flux[:-2, 1:-1]) / (2 * dy)
+    # Central difference for divergence, calculated for the interior cells
+    dqx_dx = (qx_on_padded_grid[1:-1, 2:] - qx_on_padded_grid[1:-1, :-2]) / (2 * dx)
+    dqy_dy = (qy_on_padded_grid[2:, 1:-1] - qy_on_padded_grid[:-2, 1:-1]) / (2 * dy)
     dh_dt = -(dqx_dx + dqy_dy)
 
     # Runge Kutta Predictor Step (updates interior state)
     h_pred_int = h + 0.5 * dt * dh_dt
     u_pred_int = u + 0.5 * dt * du_dt
     v_pred_int = v + 0.5 * dt * dv_dt
+
+    #  Velocity Clipping for Predicted Velocities 
+    vel_pred_sq = u_pred_int**2 + v_pred_int**2
+    scale_pred = np.ones_like(vel_pred_sq) 
+    for i in range(nx_int):
+        for j in range(ny_int):
+            if vel_pred_sq[i,j] > max_velocity_param**2:
+                scale_pred[i,j] = max_velocity_param / (np.sqrt(vel_pred_sq[i,j]) + 1e-9)
+    u_pred_int *= scale_pred
+    v_pred_int *= scale_pred
+
 
     h_pred_int = np.maximum(0.0, h_pred_int)
     u_pred_int = np.where(h_pred_int >= min_depth, u_pred_int, 0.0)
@@ -197,6 +207,7 @@ def compute_step(h, u, v, dem, boundary_mask,
     h_pred_pad = np.zeros((nx_pad, ny_pad), dtype=h_pred_int.dtype)
     u_pred_pad = np.zeros((nx_pad, ny_pad), dtype=u_pred_int.dtype)
     v_pred_pad = np.zeros((nx_pad, ny_pad), dtype=v_pred_int.dtype)
+    eta_pred_pad = np.zeros((nx_pad, ny_pad), dtype=dem_pad.dtype)
     
     # eta_pred_pad will be calculated after filling h_pred_pad
     h_pred_pad[1:-1, 1:-1] = h_pred_int
@@ -204,41 +215,56 @@ def compute_step(h, u, v, dem, boundary_mask,
     v_pred_pad[1:-1, 1:-1] = v_pred_int
 
     # Fill ghost cells for predicted state (using SAME LOCAL LOGIC as above)
-    for i in range(nx_pad):
-        for j in range(ny_pad):
-            if 1 <= i < nx_pad - 1 and 1 <= j < ny_pad - 1: continue
-            i_int_neighbor = min(max(0, i - 1), nx_int - 1)
-            j_int_neighbor = min(max(0, j - 1), ny_int - 1)
+    for i_ghost in range(nx_pad):
+        for j_ghost in range(ny_pad):
+            if 1 <= i_ghost < nx_pad - 1 and 1 <= j_ghost < ny_pad - 1: continue
+
+            if i_ghost == 0: 
+                i_int_neighbor = 0
+            elif i_ghost == nx_pad - 1: 
+                i_int_neighbor = nx_int - 1
+            else: 
+                i_int_neighbor = i_ghost - 1
+
+            if j_ghost == 0: 
+                j_int_neighbor = 0
+            elif j_ghost == ny_pad - 1: 
+                j_int_neighbor = ny_int - 1
+            else: 
+                j_int_neighbor = j_ghost - 1
+
             bc_type = boundary_mask[i_int_neighbor, j_int_neighbor]
 
-            # Use PREDICTED neighbor values
-            h_neighbor = h_pred_int[i_int_neighbor, j_int_neighbor]
-            u_neighbor = u_pred_int[i_int_neighbor, j_int_neighbor]
-            v_neighbor = v_pred_int[i_int_neighbor, j_int_neighbor]
+            # Use PREDICTED interior neighbor values
+            h_neighbor_val = h_pred_int[i_int_neighbor, j_int_neighbor]
+            u_neighbor_val = u_pred_int[i_int_neighbor, j_int_neighbor]
+            v_neighbor_val = v_pred_int[i_int_neighbor, j_int_neighbor]
 
-            if bc_type == 1: #
-                h_pred_pad[i, j] = h_neighbor
-                i_int_pad = i_int_neighbor + 1; j_int_pad = j_int_neighbor + 1
-                if i == i_int_pad and (j == j_int_pad - 1 or j == j_int_pad + 1):
-                    u_pred_pad[i, j] = -u_neighbor
-                    v_pred_pad[i, j] = v_neighbor 
-                elif j == j_int_pad and (i == i_int_pad - 1 or i == i_int_pad + 1):
-                    u_pred_pad[i, j] = u_neighbor
-                    v_pred_pad[i, j] = -v_neighbor 
-                elif abs(i - i_int_pad) == 1 and abs(j - j_int_pad) == 1:
-                    u_pred_pad[i, j] = -u_neighbor
-                    v_pred_pad[i, j] = -v_neighbor 
+            if bc_type == 1: # Closed Wall
+                h_pred_pad[i_ghost, j_ghost] = h_neighbor_val
+                i_int_pad_coord = i_int_neighbor + 1
+                j_int_pad_coord = j_int_neighbor + 1
+                
+                if i_ghost == i_int_pad_coord and (j_ghost == j_int_pad_coord - 1 or j_ghost == j_int_pad_coord + 1):
+                    u_pred_pad[i_ghost, j_ghost] = -u_neighbor_val
+                    v_pred_pad[i_ghost, j_ghost] =  v_neighbor_val
+                elif j_ghost == j_int_pad_coord and (i_ghost == i_int_pad_coord - 1 or i_ghost == i_int_pad_coord + 1):
+                    u_pred_pad[i_ghost, j_ghost] =  u_neighbor_val
+                    v_pred_pad[i_ghost, j_ghost] = -v_neighbor_val
+                elif abs(i_ghost - i_int_pad_coord) == 1 and abs(j_ghost - j_int_pad_coord) == 1:
+                    u_pred_pad[i_ghost, j_ghost] = -u_neighbor_val
+                    v_pred_pad[i_ghost, j_ghost] = -v_neighbor_val
                 else:
-                    u_pred_pad[i, j] = u_neighbor
-                    v_pred_pad[i, j] = v_neighbor
-            elif bc_type == 2: 
-                h_pred_pad[i, j] = h_neighbor
-                u_pred_pad[i, j] = u_neighbor
-                v_pred_pad[i, j] = v_neighbor
-            else: 
-                h_pred_pad[i, j] = h_neighbor
-                u_pred_pad[i, j] = u_neighbor
-                v_pred_pad[i, j] = v_neighbor
+                    u_pred_pad[i_ghost, j_ghost] = u_neighbor_val
+                    v_pred_pad[i_ghost, j_ghost] = v_neighbor_val
+            elif bc_type == 2: # Open Outlet
+                h_pred_pad[i_ghost, j_ghost] = h_neighbor_val
+                u_pred_pad[i_ghost, j_ghost] = u_neighbor_val
+                v_pred_pad[i_ghost, j_ghost] = v_neighbor_val
+            else: # Default/Safety (e.g. bc_type 0 or -1)
+                h_pred_pad[i_ghost, j_ghost] = h_neighbor_val
+                u_pred_pad[i_ghost, j_ghost] = u_neighbor_val
+                v_pred_pad[i_ghost, j_ghost] = v_neighbor_val
 
     # Calculate predicted eta_pad
     eta_pred_pad = dem_pad + h_pred_pad
@@ -251,7 +277,8 @@ def compute_step(h, u, v, dem, boundary_mask,
     detady_pred = (eta_pred_pad[2:, 1:-1] - eta_pred_pad[:-2, 1:-1]) / (2 * dy)
 
     # Predicted Advection (using interior predicted u/v for direction)
-    u_pred_int_dir = u_pred_int; v_pred_int_dir = v_pred_int 
+    u_pred_int_dir = u_pred_int
+    v_pred_int_dir = v_pred_int 
 
     # Same upwinding logic as above but using predicted u/v for gradients
     dudx_fwd_pred = (u_pred_pad[1:-1, 2:] - u_pred_pad[1:-1, 1:-1]) / dx
@@ -271,8 +298,8 @@ def compute_step(h, u, v, dem, boundary_mask,
     adv_v_dvdy_pred = np.where(v_pred_int_dir > 0, v_pred_int_dir * dvdy_bwd_pred, v_pred_int_dir * dvdy_fwd_pred)
 
     # Predicted Friction (using interior predicted h,u,v)
-    # .
-    vel_mag_sq_pred = u_pred_int**2 + v_pred_int**2; vel_mag_pred = np.sqrt(vel_mag_sq_pred + 1e-9)
+    vel_mag_sq_pred = u_pred_int**2 + v_pred_int**2
+    vel_mag_pred = np.sqrt(vel_mag_sq_pred + 1e-9)
     friction_term_pred = g * manning**2 / ((h_pred_safe + 1e-9)**(4./3.))
     friction_u_pred = friction_term_pred * u_pred_int * vel_mag_pred
     friction_v_pred = friction_term_pred * v_pred_int * vel_mag_pred
@@ -281,42 +308,42 @@ def compute_step(h, u, v, dem, boundary_mask,
     du_dt_pred = -adv_u_dudx_pred - adv_v_dudy_pred - g * detadx_pred - friction_u_pred
     dv_dt_pred = -adv_u_dvdx_pred - adv_v_dvdy_pred - g * detady_pred - friction_v_pred
 
-    # Predicted Continuity (Flux divergence using interior predicted h,u,v for fluxes)
-    qx_pred = h_pred_int * u_pred_int
-    qy_pred = h_pred_int * v_pred_int
+    # Calculate fluxes on the *entire PREDICTED padded grid*
+    qx_pred_on_padded_grid = h_pred_pad * u_pred_pad
+    qy_pred_on_padded_grid = h_pred_pad * v_pred_pad
 
-    qx_pred_pad_flux = np.zeros((nx_pad, ny_pad), dtype=qx_pred.dtype)
-    qx_pred_pad_flux[1:-1, 1:-1] = qx_pred
-    qx_pred_pad_flux[0, :] = qx_pred_pad_flux[1, :]
-    qx_pred_pad_flux[-1, :] = qx_pred_pad_flux[-2, :]
-    qx_pred_pad_flux[:, 0] = qx_pred_pad_flux[:, 1]
-    qx_pred_pad_flux[:, -1] = qx_pred_pad_flux[:, -2]
-
-    qy_pred_pad_flux = np.zeros((nx_pad, ny_pad), dtype=qy_pred.dtype)
-    qy_pred_pad_flux[1:-1, 1:-1] = qy_pred
-    qy_pred_pad_flux[0, :] = qy_pred_pad_flux[1, :]
-    qy_pred_pad_flux[-1, :] = qy_pred_pad_flux[-2, :]
-    qy_pred_pad_flux[:, 0] = qy_pred_pad_flux[:, 1]
-    qy_pred_pad_flux[:, -1] = qy_pred_pad_flux[:, -2]
-
-    dqx_dx_pred = (qx_pred_pad_flux[1:-1, 2:] - qx_pred_pad_flux[1:-1, :-2]) / (2 * dx)
-    dqy_dy_pred = (qy_pred_pad_flux[2:, 1:-1] - qy_pred_pad_flux[:-2, 1:-1]) / (2 * dy)
+    dqx_dx_pred = (qx_pred_on_padded_grid[1:-1, 2:] - qx_pred_on_padded_grid[1:-1, :-2]) / (2 * dx)
+    dqy_dy_pred = (qy_pred_on_padded_grid[2:, 1:-1] - qy_pred_on_padded_grid[:-2, 1:-1]) / (2 * dy)
     dh_dt_pred = -(dqx_dx_pred + dqy_dy_pred)
 
     # Runge Kutta Corrector Step (Update interior state using predicted rates) 
-    h_new = h + dt * dh_dt_pred
-    u_new = u + dt * du_dt_pred
-    v_new = v + dt * dv_dt_pred
+    h_final = h + dt * dh_dt_pred
+    u_final = u + dt * du_dt_pred
+    v_final = v + dt * dv_dt_pred
+
+    #  Velocity Clipping for Final Velocities
+    vel_final_sq = u_final**2 + v_final**2
+    scale_final = np.ones_like(vel_final_sq)
+    for i in range(nx_int):
+        for j in range(ny_int):
+            if vel_final_sq[i,j] > max_velocity_param**2:
+                scale_final[i,j] = max_velocity_param / (np.sqrt(vel_final_sq[i,j]) + 1e-9)
+    u_final *= scale_final
+    v_final *= scale_final
 
     # Post-Timestep Adjustments (applied to interior results) 
-    h_new = np.maximum(0.0, h_new)
+    h_final = np.maximum(0.0, h_final)
     if infiltration_rate > 0:
         potential_infiltration = infiltration_rate * dt
-        actual_infiltration = np.minimum(h_new, potential_infiltration)
-        h_new -= actual_infiltration
-        h_new = np.maximum(0.0, h_new)
-    u_new = np.where(h_new >= min_depth, u_new, 0.0)
-    v_new = np.where(h_new >= min_depth, v_new, 0.0)
-    h_new = np.nan_to_num(h_new); u_new = np.nan_to_num(u_new); v_new = np.nan_to_num(v_new)
+        actual_infiltration = np.minimum(h_final, potential_infiltration)
+        h_final -= actual_infiltration
+        h_final = np.maximum(0.0, h_final)
+    u_final = np.where(h_final >= min_depth, u_final, 0.0)
+    v_final = np.where(h_final >= min_depth, v_final, 0.0)
+    
+    # Handle NaN values (if any) in final results
+    h_final = np.nan_to_num(h_final)
+    u_final = np.nan_to_num(u_final)
+    v_final = np.nan_to_num(v_final)
 
-    return h_new, u_new, v_new 
+    return h_final, u_final, v_final

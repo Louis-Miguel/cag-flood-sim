@@ -326,17 +326,79 @@ def generate_boundary_mask(dem, valid_mask, outlet_threshold_percentile=5.0):
     print(f"Generated boundary mask: {num_walls} wall cells, {num_outlets} potential outlet cells identified.")
     return boundary_mask
 
-if __name__ == "__main__":
-    # Example usage of the functions
-    dem_file = './Cagayan_Valley_ESPG4326.tif'  # Replace with your DEM file path
-    dem, valid_mask, metadata = load_dem_from_file(dem_file, preprocess=True , fill_sinks_flag=False)
-    import matplotlib.pyplot as plt
-    
-    plt.figure(figsize=(12, 10))
-    plt.imshow(dem, cmap='terrain')      
-    plt.colorbar(label='Elevation (m)')
-    plt.title('Filled DEM')
-    plt.show()
+
+def create_natural_river_dem(rows=100, cols=300,
+                            base_elev=20.0, main_slope=0.01, cross_slope=0.001,
+                            channel_width=15.0, channel_depth=4.0,
+                            meander_amplitude=15.0, meander_freq=2.5,
+                            noise_sigma=2.0, noise_strength=0.5,
+                            final_smooth_sigma=1.0):
+    """
+    Generates a synthetic DEM representing a meandering river valley.
+
+    Parameters:
+        (See argparse help in driver script for descriptions)
+
+    Returns:
+        dem (np.ndarray): The generated DEM.
+        valid_mask (np.ndarray): Mask (all True for synthetic DEM).
+        start_center_row (int): Approximate row index of the channel centerline near col=0.
+    """
+    print("Generating natural river DEM...")
+    # Create coordinate grid (use matrix indexing 'ij' for consistency)
+    r_coords, c_coords = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+
+    # Base plane with main slope (downstream, positive cols) and cross slope
+    dem = base_elev - main_slope * c_coords - cross_slope * r_coords
+
+    # Meandering centerline
+    # Normalize column index [0, 1] for frequency calculation
+    c_norm = c_coords / float(cols - 1) if cols > 1 else 0.0
+    centerline_row = (rows / 2.0) + meander_amplitude * np.sin(meander_freq * 2 * np.pi * c_norm)
+
+    # Carve channel using Gaussian profile relative to centerline
+    # Gaussian width parameter relates to channel_width (e.g., sigma = width / 4 or similar)
+    channel_sigma = channel_width / 4.0
+    dist_from_center = np.abs(r_coords - centerline_row)
+    # Ensure channel sigma is positive to avoid division by zero
+    if channel_sigma > 1e-6:
+        channel_carve_depth = channel_depth * np.exp(-(dist_from_center**2) / (2 * channel_sigma**2))
+        dem -= channel_carve_depth
+    else:
+        print("Warning: Channel width too small, skipping channel carving.")
 
 
-    
+    # Add smoothed random noise for terrain variation
+    if noise_strength > 0 and noise_sigma > 0:
+        print("Adding terrain noise...")
+        random_noise = np.random.randn(rows, cols) * noise_strength
+        smoothed_noise = gaussian_filter(random_noise, sigma=noise_sigma)
+        dem += smoothed_noise
+    else:
+        print("Skipping terrain noise.")
+
+    # Apply final smoothing to the entire DEM
+    if final_smooth_sigma > 0:
+        print("Applying final smoothing...")
+        dem = gaussian_filter(dem, sigma=final_smooth_sigma)
+    else:
+        print("Skipping final smoothing.")
+
+    # Ensure minimum elevation is slightly positive (optional, avoids issues with h=0 exactly)
+    min_elev = np.min(dem)
+    if min_elev <= 0:
+        dem += abs(min_elev) + 0.1 # Shift up
+
+    valid_mask = np.ones((rows, cols), dtype=bool) # All cells are valid
+
+    # Calculate approximate starting row of centerline for initial water patch placement
+    start_center_row = int(round((rows / 2.0) + meander_amplitude * np.sin(0.0)))
+    # Clamp to valid row indices
+    start_center_row = max(0, min(rows - 1, start_center_row))
+
+    print("Natural river DEM created.")
+    dem_min_final = np.min(dem)
+    dem_max_final = np.max(dem)
+    print(f" Final DEM Elevation range: {dem_min_final:.2f} to {dem_max_final:.2f}")
+
+    return dem, valid_mask, start_center_row 
