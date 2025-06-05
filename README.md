@@ -10,7 +10,7 @@ The simulation handles irregular domain boundaries defined by NoData values (NaN
 
 *   **2D Shallow Water Equations Solver:** Core hydrodynamics based on SWE.
 *   **Numerical Scheme:**
-    *   Runge-Kutta 2 (Heun's method) for time integration.
+    *   Runge-Kutta 2 (Midpoint method) for time integration.
     *   Upwind scheme for advection terms.
     *   Finite difference method on a regular grid.
 *   **Performance:** Core computational step (`compute_step`) optimized using Numba's Just-In-Time (JIT) compilation.
