@@ -122,7 +122,7 @@ python flood_simulation_driver.py -h
 ## Algorithm Overview
 *   **Governing Equations:** 2D Shallow Water Equations (SWE).
 *   **Spatial Discretization:** Finite Difference Method on a regular grid.
-*   **Time Integration:** Runge-Kutta 2nd Order (Heun's Method).
+*   **Time Integration:** Runge-Kutta 2nd Order (Midpoint Method).
 *   **Advection:** First-order Upwind Scheme.
 *   **Boundary Conditions:** Ghost cell approach informed by a pre-calculated boundary mask (`-1`: Outside, `0`: Internal, `1`: Wall, `2`: Open Outlet). Wall BCs use velocity reflection; Open BCs use zero-gradient.
 *   **Sink Filling:** Priority-Flood algorithm (`flood_tools.fill_sinks_priority_flood`).

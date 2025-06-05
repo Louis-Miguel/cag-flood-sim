@@ -3,6 +3,8 @@ import heapq
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+np.random.seed(24) 
+
 def fill_sinks(dem, slope=0.001):
     """
     Fills sinks in a Digital Elevation Model using the Priority-Flood algorithm.

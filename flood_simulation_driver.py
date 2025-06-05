@@ -6,6 +6,8 @@ import numpy as np
 from flood_sim_class import FloodSimulation, run_twophase_river_rain_test
 from flood_tools import load_dem_from_file
 
+np.random.seed(24) 
+
 def flood_simulation_driver(args):
     """
     Loads data, sets up, runs, and visualizes the flood simulation
@@ -246,7 +248,7 @@ if __name__ == "__main__":
     source_group = parser.add_argument_group('Water Sources')
     source_group.add_argument("--source-row", type=int, default=None, help="Row index (0-based) for point water source.")
     source_group.add_argument("--source-col", type=int, default=None, help="Column index (0-based) for point water source.")
-    source_group.add_argument("--source-rate", type=float, default=10.0, help="Inflow rate for point source (m³/s).")
+    source_group.add_argument("--source-rate", type=float, default=0.0, help="Inflow rate for point source (m³/s).")
     source_group.add_argument("--source-duration", type=int, default=None, help="Duration (steps) for point source (None=continuous).")
 
     # Rainfall Arguments

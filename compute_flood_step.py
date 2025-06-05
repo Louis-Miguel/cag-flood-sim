@@ -1,6 +1,8 @@
 import numba # Required: pip install numba
 import numpy as np
 
+np.random.seed(24) 
+
 @numba.jit(nopython=True, cache=True) # Numba decorator for JIT compilation (Faster Python)
 def compute_step(h, u, v, dem, boundary_mask, 
                     g, manning, dx, dy, dt,
@@ -55,7 +57,6 @@ def compute_step(h, u, v, dem, boundary_mask,
     dem_pad[0, -1] = dem_pad[1, -2]
     dem_pad[-1, 0] = dem_pad[-2, 1]
     dem_pad[-1, -1] = dem_pad[-2, -2]
-
     # Fill ghost cells based on boundary_mask and *local orientation*
     for i_ghost in range(nx_pad):
         for j_ghost in range(ny_pad):

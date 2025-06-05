@@ -7,6 +7,9 @@ from matplotlib.colors import LightSource, Normalize
 from flood_tools import generate_boundary_mask, create_natural_river_dem
 from compute_flood_step import compute_step
 
+
+np.random.seed(24) 
+
 class FloodSimulation:
     def __init__(self, dem, valid_mask, 
                 dx=1.0, dy=1.0, g=9.81, 
@@ -47,6 +50,7 @@ class FloodSimulation:
         self.min_depth = float(min_depth)
         self.target_time = float(target_time)
         self.steady_state_h = None
+        self.dem_contour_thresholds_viz = [] # For phased viz
 
         # Generate boundary mask based on DEM and valid_mask
         self.boundary_mask = generate_boundary_mask(self.dem, self.valid_mask, outlet_threshold_percentile)
@@ -124,8 +128,8 @@ class FloodSimulation:
             # Smooth the distribution
             dist = gaussian_filter(dist, sigma=2.0)
             # Normalize
-            if max_dist > 1e-9:
-                dist /= max_dist
+            if np.max(dist) > 1e-9:
+                dist /= np.max(dist)
             else:
                 dist = np.ones_like(self.dem) 
         else:
@@ -182,7 +186,6 @@ class FloodSimulation:
             h_valid = self.h[self.valid_mask]
             u_valid = self.u[self.valid_mask]
             v_valid = self.v[self.valid_mask]
-
             with np.errstate(invalid='ignore', divide='ignore'):
                 # Use valid subsets for max calculations
                 max_vel_sq = np.max(u_valid**2 + v_valid**2) if u_valid.size > 0 else 0.0
@@ -195,7 +198,7 @@ class FloodSimulation:
                 max_depth = 0.0
 
             # Adjust timestep based on CFL condition (Courant-Friedrichs-Lewy (CFL) condition)
-            wave_speed = np.sqrt(self.g * max(max_depth, self.min_depth))
+            wave_speed = np.sqrt(self.g * max(max_depth, self.min_depth)) # Add epsilon to avoid division by zero
             denominator = wave_speed + max_vel + 1e-9 
             dt_cfl = self.stability_factor * min(self.dx, self.dy) / denominator
             
@@ -203,8 +206,6 @@ class FloodSimulation:
             max_dt_allowed = max(self.original_dt_guess, self.dt * 1.5)
 
             self.dt = min(dt_cfl, max_dt_allowed)
-
-            self.dt = np.clip(self.dt, 1e-9, self.original_dt_guess * 10)
 
             if self.dt < 1e-9: 
                 print("Warning: Timestep extremely small...") 
@@ -214,22 +215,8 @@ class FloodSimulation:
         h_new, u_new, v_new = compute_step(
             self.h, self.u, self.v, self.dem, self.boundary_mask, # Pass mask
             self.g, self.manning, self.dx, self.dy, self.dt,
-            self.infiltration_rate, self.min_depth, self.max_velocity
+            self.infiltration_rate, self.min_depth
         )
-
-        # # Post-computation checks/updates (apply only to valid area)
-
-        # # Velocity Clipping
-        # vel_new_sq = u_new**2 + v_new**2
-        # scale = np.ones_like(vel_new_sq)
-        
-        # mask_to_scale = self.valid_mask & (vel_new_sq > self.max_velocity**2)
-        # if np.any(mask_to_scale):
-        #     # Add epsilon to prevent division by zero if vel_new_sq is exactly max_velocity**2
-        #     scale[mask_to_scale] = self.max_velocity / (np.sqrt(vel_new_sq[mask_to_scale]) + 1e-9)
-
-        #     u_new[mask_to_scale] *= scale[mask_to_scale]
-        #     v_new[mask_to_scale] *= scale[mask_to_scale]
 
         # Apply Sources/Rainfall
         h_new_after_sources = self.apply_sources_or_rainfall(h_new)
@@ -359,7 +346,7 @@ class FloodSimulation:
 
     def visualize_results(self, results, time_steps, output_path=None,show_animation=True, save_last_frame=True,
                             hillshade=True, contour_levels=10,
-                            show_boundary_mask=True, steady_state_viz_active=False):
+                            show_boundary_mask=True, steady_state_viz_active=True, num_phase1_frames=0):
         """
         Visualize the simulation results with enhanced terrain visualization.
         Handles potential issues with empty or NaN results and large DEMs.
@@ -381,373 +368,291 @@ class FloodSimulation:
             return None
 
         num_subplots = 2 if show_boundary_mask else 1
-        fig = plt.figure(figsize=(8 * num_subplots, 8)) # Adjust figsize
+        fig = plt.figure(figsize=(10 * num_subplots, 8))
 
-        # Use GridSpec for better layout control
         if show_boundary_mask:
-            gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1]) # 1 row, 2 columns
-            ax_sim = plt.subplot(gs[0]) # Simulation plot axes
-            ax_mask = plt.subplot(gs[1]) # Boundary mask axes
+            gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1])
+            ax_sim = plt.subplot(gs[0])
+            ax_mask = plt.subplot(gs[1])
         else:
             gs = gridspec.GridSpec(1, 1)
-            ax_sim = plt.subplot(gs[0]) # Only simulation plot axes
-            ax_mask = None # No mask axes needed
+            ax_sim = plt.subplot(gs[0])
+            ax_mask = None
 
-        # Plot Boundary Mask
         if ax_mask:
-            print("Plotting Boundary Mask...")
             ax_mask.set_title("Boundary Mask (-1:Out, 0:In, 1:Wall, 2:Open)")
-            # Define colors and normalization for the mask codes
-            cmap_mask = mcolors.ListedColormap(['lightgrey', 'white', 'black', 'blue'])
-            bounds = [-1.5, -0.5, 0.5, 1.5, 2.5] # Define bin edges for discrete values
-            norm_mask = mcolors.BoundaryNorm(bounds, cmap_mask.N)
-
-            mask_plot = ax_mask.imshow(self.boundary_mask, cmap=cmap_mask, norm=norm_mask,
+            cmap_mask_viz = mcolors.ListedColormap(['lightgrey', 'white', 'black', 'blue'])
+            bounds_mask_viz = [-1.5, -0.5, 0.5, 1.5, 2.5]
+            norm_mask_viz = mcolors.BoundaryNorm(bounds_mask_viz, cmap_mask_viz.N)
+            mask_plot_obj = ax_mask.imshow(self.boundary_mask, cmap=cmap_mask_viz, norm=norm_mask_viz,
                                     interpolation='none', origin='upper',
                                     extent=(0, self.ny*self.dx, 0, self.nx*self.dy))
-
-            # Create a colorbar for the boundary mask
-            cbar_mask = plt.colorbar(mask_plot, ax=ax_mask, shrink=0.7, ticks=[-1, 0, 1, 2])
-            cbar_mask.set_ticklabels(['Outside', 'Internal', 'Wall', 'Outlet'])
+            cbar_mask_plot = plt.colorbar(mask_plot_obj, ax=ax_mask, shrink=0.7, ticks=[-1, 0, 1, 2])
+            cbar_mask_plot.set_ticklabels(['Outside', 'Internal', 'Wall', 'Outlet'])
             ax_mask.set_xlabel("X distance (m)")
             ax_mask.set_ylabel("Y distance (m)")
-            print("Boundary Mask plotted.")
+
+        ax_sim.set_title(f'Flood Simulation (Frame 0)')
+
+        dem_display_viz = self.dem.copy()
+        dem_display_viz[~self.valid_mask] = np.nan
+
+        self.dem_contour_thresholds_viz = []
+        if contour_levels > 0:
+            # Use nanmin/nanmax safely on potentially all-NaN masked DEM
+            valid_dem_cells = dem_display_viz[self.valid_mask]
+            cont_min_dem_viz = np.nanmin(valid_dem_cells) if valid_dem_cells.size > 0 else 0
+            cont_max_dem_viz = np.nanmax(valid_dem_cells) if valid_dem_cells.size > 0 else 1
+            
+            if not (np.isnan(cont_min_dem_viz) or np.isnan(cont_max_dem_viz) or cont_max_dem_viz <= cont_min_dem_viz):
+                num_actual_levels_viz = max(2, contour_levels) 
+                self.dem_contour_thresholds_viz = sorted(list(np.linspace(cont_min_dem_viz, cont_max_dem_viz, num_actual_levels_viz)))
+                if contour_levels == 1 and len(self.dem_contour_thresholds_viz) > 1: 
+                    self.dem_contour_thresholds_viz = [self.dem_contour_thresholds_viz[len(self.dem_contour_thresholds_viz)//2]]
+            else: 
+                default_elev_viz = np.nanmedian(valid_dem_cells) if valid_dem_cells.size > 0 else 10.0
+                self.dem_contour_thresholds_viz = [default_elev_viz] if not np.isnan(default_elev_viz) else [10.0]
+            print(f"Using DEM contour thresholds for WSE viz: {self.dem_contour_thresholds_viz}")
 
 
-        # Simulation Plot Setup (on ax_sim) 
-        ax_sim.set_title(f'Flood Simulation (Frame 0)') # Initial title
-
-        # Determine Color Limits for Water Depth (Robust calculation)
-        valid_maxes = []
-        print("Calculating max water depth for color bar...")
-        for idx, h_frame in enumerate(results):
-            if h_frame is not None and h_frame.size > 0 and self.valid_mask.shape == h_frame.shape:
-                # Only consider valid cells for max depth calculation
-                h_frame_valid = h_frame[self.valid_mask]
-                if h_frame_valid.size > 0:
-                    try:
-                        max_val = np.nanmax(h_frame_valid)
-                        if np.isfinite(max_val):
-                                valid_maxes.append(max_val)
-                    except ValueError: # Should not happen if h_frame_valid.size > 0
-                        continue
-
-        if valid_maxes:
-            overall_vmax = max(valid_maxes)
-        else:
-            overall_vmax = self.min_depth * 5 # Default if no water found
-        overall_vmax = max(overall_vmax, self.min_depth * 1.1)
-
-        if np.isnan(overall_vmax): 
-            overall_vmax = 1.0 
-        
-        print(f"Overall water depth color bar max (vmax): {overall_vmax:.3f}")
-
-        # Prepare DEM for Display
-        dem_display = self.dem.copy()
-        dem_display[~self.valid_mask] = np.nan
-
-        print("Plotting DEM background on simulation axes...")
         if hillshade:
             try:
-                ls = LightSource(azdeg=315, altdeg=45)
-                dem_min_valid = np.nanmin(dem_display)
-                dem_max_valid = np.nanmax(dem_display)
-                
-                if np.isnan(dem_min_valid) or np.isnan(dem_max_valid) or dem_max_valid <= dem_min_valid:
-                    # Handle cases with no valid DEM data or flat DEM
-                    print("Warning: DEM data is missing, flat, or invalid. Cannot generate hillshade accurately.")
-                    # Create a dummy shaded background (e.g., grey)
-                    rgb = np.full((self.nx, self.ny, 3), 0.7) # Grey background
-                    hillshade = True 
-                
+                ls_viz = LightSource(azdeg=315, altdeg=45)
+                dem_min_valid_viz = np.nanmin(dem_display_viz) # Use full dem_display for min/max
+                dem_max_valid_viz = np.nanmax(dem_display_viz)
+                if np.isnan(dem_min_valid_viz) or np.isnan(dem_max_valid_viz) or dem_max_valid_viz <= dem_min_valid_viz:
+                    rgb_hillshade = np.full((self.nx, self.ny, 3), 0.7) # Default grey
                 else:
-                    # Normalize valid DEM data for shading
-                    dem_norm_val = (dem_display - dem_min_valid) / (dem_max_valid - dem_min_valid)
-                    # Fill NaN values *in the normalized array* for shading function
-                    # Use a neutral value (0.5) for NaNs
-                    dem_for_shade = np.nan_to_num(dem_norm_val, nan=0.5)
-
-                    print("Performing hillshading calculation...")
-                    rgb = ls.shade(dem_for_shade, cmap=plt.cm.terrain, vert_exag=1.0, blend_mode='soft')
-                    print("Hillshading calculation complete.")
-
-
-
-                # Convert shaded RGB to RGBA uint8 for imshow, applying transparency mask
-                if rgb.ndim == 3 and rgb.shape[2] >= 3:
-                    rgba = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
-                    rgba[:, :, :3] = np.clip(rgb[:, :, :3] * 255, 0, 255).astype(np.uint8)
-                    rgba[:, :, 3] = 255 # Start fully opaque
-                    # Apply transparency where the original DEM was invalid (NaN)
-                    rgba[~self.valid_mask, 3] = 0
-                else: # Fallback if shade output is unexpected
-                    print("Warning: Hillshade output unexpected format. Falling back to non-hillshade.")
-                    hillshade = False # Force non-hillshade path below
-
-                if hillshade:
-                    dem_plot = ax_sim.imshow(rgba, extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
-                                            origin='upper', interpolation='nearest')
-
-            except Exception as e_shade:
-                print(f"ERROR during hillshading: {e_shade}. Falling back.")
-                hillshade = False
-
-        if not hillshade: # If hillshade failed or was disabled
-            terrain_cmap = plt.cm.terrain.copy()
-            terrain_cmap.set_bad(color='white', alpha=0) # Make NaNs transparent
-            terrain_vmin = np.nanmin(dem_display)
-            terrain_vmax = np.nanmax(dem_display)
-            # Handle case where DEM is flat or all NaN
-            if np.isnan(terrain_vmin) or np.isnan(terrain_vmax) or terrain_vmax <= terrain_vmin:
-                terrain_vmin, terrain_vmax = 0, 1 # Default range
-            dem_plot = ax_sim.imshow(dem_display, cmap=terrain_cmap,
-                                    vmin=terrain_vmin, vmax=terrain_vmax,
+                    dem_norm_val_viz = (dem_display_viz - dem_min_valid_viz) / (dem_max_valid_viz - dem_min_valid_viz)
+                    dem_for_shade_viz = np.nan_to_num(dem_norm_val_viz, nan=0.5) # Fill NaNs for shading
+                    rgb_hillshade = ls_viz.shade(dem_for_shade_viz, cmap=plt.cm.terrain, vert_exag=1.0, blend_mode='soft')
+                
+                if rgb_hillshade.ndim == 3 and rgb_hillshade.shape[2] >= 3:
+                    rgba_hillshade = np.zeros((rgb_hillshade.shape[0], rgb_hillshade.shape[1], 4), dtype=np.uint8)
+                    rgba_hillshade[:, :, :3] = np.clip(rgb_hillshade[:, :, :3] * 255, 0, 255).astype(np.uint8)
+                    rgba_hillshade[:, :, 3] = 255 # Opaque
+                    rgba_hillshade[~self.valid_mask, 3] = 0 # Transparent where DEM is invalid
+                    ax_sim.imshow(rgba_hillshade, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper', interpolation='nearest', zorder=1)
+                else: 
+                    hillshade = False
+            except Exception: 
+                hillshade = False 
+        if not hillshade: 
+            terrain_cmap_viz = plt.cm.terrain.copy()
+            terrain_cmap_viz.set_bad(color='white', alpha=0) # NaNs in DEM transparent
+            terrain_vmin_viz = np.nanmin(dem_display_viz)
+            terrain_vmax_viz = np.nanmax(dem_display_viz)
+            if np.isnan(terrain_vmin_viz) or np.isnan(terrain_vmax_viz) or terrain_vmax_viz <= terrain_vmin_viz: # Flat or all NaN
+                terrain_vmin_viz, terrain_vmax_viz = 0, 1 # Default range
+            ax_sim.imshow(dem_display_viz, cmap=terrain_cmap_viz,
+                                    vmin=terrain_vmin_viz, vmax=terrain_vmax_viz,
                                     extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
-                                    origin='upper', interpolation='nearest')
+                                    origin='upper', interpolation='nearest', zorder=1)
 
-        print("DEM background plotted.")
-
-        # Add Contour Lines on ax_sim 
-        if contour_levels > 0:
-            print(f"Adding {contour_levels} contour lines...")
+        if contour_levels > 0 and self.dem_contour_thresholds_viz:
             try:
-                # Use nanmin/max for contour levels to avoid issues with NaNs
-                cont_min = np.nanmin(dem_display)
-                cont_max = np.nanmax(dem_display)
-                if not (np.isnan(cont_min) or np.isnan(cont_max) or cont_max <= cont_min):
-                    levels = np.linspace(cont_min, cont_max, contour_levels)
-                    # Contour requires finite values, fill NaNs temporarily
-                    dem_for_contour = np.nan_to_num(dem_display, nan=cont_min) # Fill with min
-                    ax_sim.contour(dem_for_contour, colors='black', alpha=0.3, levels=levels, linewidths=0.5,
-                                extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper')
-                else:
-                    print("Warning: Cannot draw contours due to invalid DEM range.")
-            except Exception as e_contour:
-                print(f"Warning: Could not draw contours. {e_contour}")
-            print("Contours added.")
+                # Fill NaNs for contouring, e.g., with min valid DEM value
+                dem_for_contour_viz = dem_display_viz.copy()
+                fill_val_contour = np.nanmin(dem_for_contour_viz[self.valid_mask]) if np.any(self.valid_mask) else 0
+                dem_for_contour_viz[~self.valid_mask] = fill_val_contour 
+                dem_for_contour_viz = np.nan_to_num(dem_for_contour_viz, nan=fill_val_contour)
 
-        #Water Visualization Setup on ax_sim 
-        print("Setting up water layer...")
+                ax_sim.contour(dem_for_contour_viz, colors='black', alpha=0.3, levels=self.dem_contour_thresholds_viz,
+                            linewidths=0.5, extent=(0, self.ny*self.dx, 0, self.nx*self.dy), origin='upper', zorder=2)
+            except Exception as e_contour_viz:
+                print(f"Warning: Could not draw DEM contours. {e_contour_viz}")
 
-        custom_cmap_active = steady_state_viz_active and (self.steady_state_h is not None)
+        use_global_wse_layered_viz = steady_state_viz_active and num_phase1_frames > 0 and self.steady_state_h is not None
 
-        if custom_cmap_active:
-            print("Using custom steady-state + overflow colormap.")
-            
-            blue_gradient_map = plt.cm.get_cmap('Blues', 256) 
-            overflow_colors = blue_gradient_map(np.linspace(0.1, 0.9, 200))
-            black = np.array([0, 0, 0, 1]) # Black for steady flow (RGBA)
+        black_cmap = mcolors.ListedColormap(['black'])
+        black_cmap.set_bad('none')
 
-            # Define how many "levels" or color slots represent the steady state (black)
-            num_black_levels = 10 # Adjust thickness of black band if needed
+        max_h_for_norm = np.nanmax(results) if results and np.any([r is not None for r in results]) else self.min_depth * 2
 
-            # Combine: stack black levels then the blue gradient
-            combined_colors = np.vstack((np.tile(black, (num_black_levels, 1)), overflow_colors))
-            water_cmap = mcolors.LinearSegmentedColormap.from_list("RiverOverflow", combined_colors)
-            water_cmap.set_bad('none') # Transparent for NaN/masked values
+        if np.isnan(max_h_for_norm) or max_h_for_norm <= self.min_depth : 
+            max_h_for_norm = self.min_depth * 2
 
-            # Normalization for custom map:
-            # Range [min_depth, h_steady_marker] -> Black
-            # Range (h_steady_marker, overall_vmax] -> Blue gradient
-            steady_h = self.steady_state_h
-            if hasattr(steady_h, 'get'): 
-                steady_h = steady_h.get()
-                
-            relevant_steady_depths = steady_h[self.valid_mask & (steady_h > self.min_depth)]
+        norm_black = Normalize(vmin=self.min_depth, vmax=max_h_for_norm)
+        
+        blue_cmap = plt.cm.Blues.copy()
+        blue_cmap.set_bad('none')
+        norm_blue = Normalize(vmin=0, vmax=max_h_for_norm)
 
-            if relevant_steady_depths.size > 0:
-                # Use a high percentile (e.g., 95th) to represent the main flow depth
-                h_steady_marker = np.percentile(relevant_steady_depths, 95)
-                # Ensure marker is slightly above min_depth for distinct boundary
-                h_steady_marker = max(h_steady_marker, self.min_depth * 1.05)
-            else:
-                # Fallback if no water in steady state (unlikely for river scenario)
-                h_steady_marker = self.min_depth + 1e-3 # Slightly above min_depth
+        self.layered_fill_cmap = None
+        self.layered_fill_norm = None
+        if use_global_wse_layered_viz and self.dem_contour_thresholds_viz:
+            num_shades = len(self.dem_contour_thresholds_viz)
+            if num_shades > 0:
+                grey_vals = np.linspace(1, 0.50, num_shades) # Darker grey to lighter grey
+                self.layered_fill_cmap = mcolors.ListedColormap([plt.cm.Greys(v) for v in grey_vals])
+                self.layered_fill_cmap.set_bad(alpha=0) 
+                self.layered_fill_norm = mcolors.BoundaryNorm(np.arange(-0.5, num_shades), self.layered_fill_cmap.N)
+            else: 
+                use_global_wse_layered_viz = False
 
-            print(f"Steady-state marker depth for black color: {h_steady_marker:.3f}m")
+        first_h = results[0] if results else np.zeros_like(self.dem)
+        mask_init = ~self.valid_mask | (first_h <= self.min_depth)
+        init_display = np.ma.masked_where(mask_init, first_h)
+        init_cmap, init_norm, init_cbar_label = (black_cmap, norm_black, 'River Depth (m) - P1') if use_global_wse_layered_viz else (blue_cmap, norm_blue, 'Water Depth (m)')
 
-            # Define the boundaries for the normalization
-            # Ensure boundaries are distinct and ordered: min_depth < h_steady_marker < overall_vmax
+        main_water_plot = ax_sim.imshow(init_display, cmap=init_cmap, norm=init_norm, alpha=1.0, origin='upper', extent=(0, self.ny*self.dx, 0, self.nx*self.dy), zorder=10)
+        fixed_river_underlay = ax_sim.imshow(np.ma.masked_array(np.zeros_like(self.dem), True), cmap=black_cmap, norm=norm_black, alpha=1.0, origin='upper', extent=(0, self.ny*self.dx, 0, self.nx*self.dy), zorder=9, visible=False)
 
-            if h_steady_marker >= overall_vmax:
-                # If steady marker is too high, adjust it down slightly below vmax
-                # This might happen if vmax itself is very low.
-                h_steady_marker = overall_vmax - (overall_vmax - self.min_depth) * 0.1
-                # Ensure it's still above min_depth
-                h_steady_marker = max(h_steady_marker, self.min_depth + 1e-4)
-                print(f"Adjusted steady marker due to vmax: {h_steady_marker:.3f}m")
+        cbar = plt.colorbar(main_water_plot, ax=ax_sim, label=init_cbar_label, shrink=0.7)
 
-            # Final check for distinct bounds
-            color_bounds = [0, h_steady_marker, overall_vmax] # Start bound at 0 for clarity
+        source_labels_viz = []
+        for i_src, source_item_viz in enumerate(self.sources):
+            if 0 <= source_item_viz['row'] < self.nx and 0 <= source_item_viz['col'] < self.ny and self.valid_mask[source_item_viz['row'], source_item_viz['col']]:
+                x_coord_src_viz = (source_item_viz['col'] + 0.5) * self.dx
+                y_coord_src_viz = self.nx * self.dy - (source_item_viz['row'] + 0.5 ) * self.dy
+                handle_src_viz = ax_sim.plot(x_coord_src_viz, y_coord_src_viz, 'ro', markersize=8, markeredgecolor='k', label=f'Source {i_src+1}', zorder=20)
+                source_labels_viz.append(handle_src_viz[0])
+        if source_labels_viz: 
+            ax_sim.legend(handles=source_labels_viz, loc='upper right')
 
-            if not (color_bounds[0] < color_bounds[1] < color_bounds[2]):
-                print("Warning: Cannot create distinct bounds for custom colormap. Falling back to standard Blues.")
-                custom_cmap_active = False # Disable custom map
-                # Fallback to standard Blues
-                water_cmap = plt.cm.Blues.copy()
-                water_cmap.set_bad('none')
-                norm_water = Normalize(vmin=0, vmax=overall_vmax) # Standard norm
-            else:
-                # Create the BoundaryNorm
-                norm_water = mcolors.BoundaryNorm(color_bounds, water_cmap.N)
-
-        else:
-            if steady_state_viz_active: # Print message only if it was requested but failed
-                print("Steady state visualization requested but steady state data missing. Using standard Blues.")
-            water_cmap = plt.cm.Blues.copy()
-            water_cmap.set_bad('none') # Make values below vmin/NaNs transparent
-            norm_water = Normalize(vmin=0, vmax=overall_vmax) # Use vmin=0 for standard
-
-        water_cmap = plt.cm.Blues.copy(); water_cmap.set_bad('none')
-
-        first_frame = results[0]
-        if first_frame is not None and first_frame.size > 0:
-            # Mask values below min_depth and outside valid area
-            mask = ~self.valid_mask | (first_frame <= self.min_depth)
-            masked_water = np.ma.masked_where(mask, first_frame)
-        else:
-            # Create an empty masked array if first frame is invalid
-            masked_water = np.ma.masked_array(np.zeros_like(self.dem), mask=True)
-
-
-        # Plot water on ax_sim
-        water_plot = ax_sim.imshow(masked_water, cmap=water_cmap, norm=norm_water, alpha=0.7,
-                                extent=(0, self.ny*self.dx, 0, self.nx*self.dy),
-                                origin='upper', interpolation='nearest', zorder=10)
-
-        # Add colorbar for water depth, associated with ax_sim
-        cbar_water = plt.colorbar(water_plot, ax=ax_sim, pad=0.01, label='Water Depth (m)', shrink=0.7)
-
-        if custom_cmap_active:
-            # Set ticks at the boundaries
-            cbar_water.set_ticks(color_bounds)
-            # Set labels explaining the sections
-            cbar_water.set_ticklabels([f'{color_bounds[0]:.1f}', f'River ({color_bounds[1]:.1f})', f'{color_bounds[2]:.1f} (Overflow)'])
-
-
-
-        # Add Water Source Markers on ax_sim 
-        source_labels = []
-        for i, source in enumerate(self.sources):
-            # Check if source location is within valid DEM bounds and mask
-            if 0 <= source['row'] < self.nx and 0 <= source['col'] < self.ny:
-                if self.valid_mask[source['row'], source['col']]:
-                    # Calculate plot coordinates (origin='upper')
-                    x = (source['col'] + 0.5) * self.dx
-                    y = self.nx * self.dy - (source['row'] + 0.5 ) * self.dy # Invert row for 'upper' origin
-                    handle = ax_sim.plot(x, y, 'ro', markersize=8, markeredgecolor='k', label=f'Source {i+1}', zorder=20)
-                    source_labels.append(handle[0])
-            else:
-                print(f"Warning: Source {i+1} at ({source['row']}, {source['col']}) is outside DEM bounds.")
-
-                
-        if source_labels:
-            ax_sim.legend(handles=source_labels, loc='upper right')
-
-
-        # Add Title and Labels for ax_sim 
-        sim_title = ax_sim.set_title(f'Flood Simulation (Time: {time_steps[0]:.2f} s)') # Store title handle
+        sim_title = ax_sim.set_title(f'Flood Simulation (Time: {time_steps[0]:.2f} s)')
         ax_sim.set_xlabel("X distance (m)")
         ax_sim.set_ylabel("Y distance (m)")
 
-        print("Initial frame plotted.")
-
-        # Animation Update Function 
-        # Needs to only update artists related to ax_sim
         def update(frame_idx):
-            frame_data = results[frame_idx]
-            current_h_frame = frame_data if frame_data is not None else np.zeros_like(self.dem) # Handle None frame
+            current_h = results[frame_idx] if results[frame_idx] is not None else np.zeros_like(self.dem)
+            title = f'Flood Sim (Time: {time_steps[frame_idx]:.2f}s)'
+            cbar_lbl = 'Water Depth (m)'
+            artists = [sim_title]
+            active_cmap, active_norm = blue_cmap, norm_blue
+            is_p1 = frame_idx < num_phase1_frames
 
-            # Update water layer data
-            # Mask values below min_depth and outside valid area
-            mask_update = ~self.valid_mask | (current_h_frame <= self.min_depth)
-            masked_water_update = np.ma.masked_where(mask_update, current_h_frame)
-            water_plot.set_array(masked_water_update)
+            if use_global_wse_layered_viz:
+                if is_p1:
+                    fixed_river_underlay.set_visible(False)
+                    mask = ~self.valid_mask | (current_h <= self.min_depth)
+                    
+                    main_water_plot.set_array(np.ma.masked_where(mask, current_h))
+                    main_water_plot.set_cmap(blue_cmap)
+                    main_water_plot.set_norm(norm_blue)
+                    main_water_plot.set_alpha(1.0)
+                    
+                    active_cmap, active_norm = blue_cmap, norm_blue
+                    cbar_lbl = 'River Depth (m) - P1'
+                    title += ' - P1: River Flow Sim'
+                    artists.append(main_water_plot)
+                else: # Phase 2: Flooded Visualization
+                    fixed_river_underlay.set_array(np.ma.masked_where(~self.valid_mask | (self.steady_state_h <= self.min_depth), self.steady_state_h))
+                    fixed_river_underlay.set_visible(True)
+                    artists.append(fixed_river_underlay)
 
-            # Update title
-            sim_title.set_text(f'Flood Simulation (Time: {time_steps[frame_idx]:.2f} s)')
+                    idx_max_h = (-1,-1)
+                    h_for_max_f = np.where(self.valid_mask, current_h, -np.inf)
+                    if np.any(current_h[self.valid_mask] > self.min_depth):
+                        idx_max_h = np.unravel_index(np.argmax(h_for_max_f), self.dem.shape)
+                    
+                    idx_highest_globally_breached = -1
+                    if idx_max_h!= (-1,-1) and self.dem_contour_thresholds_viz and self.layered_fill_cmap:
+                        wse_peak = self.dem[idx_max_h] + current_h[idx_max_h]
+                        wse_peak -= 2.5
+                        for i, thresh in enumerate(self.dem_contour_thresholds_viz):
+                            if wse_peak >= thresh: 
+                                idx_highest_globally_breached = i
+                            else: 
+                                break
+                    
+                    layered_indices = np.full(self.dem.shape, -1, dtype=np.int8)
+                    if idx_highest_globally_breached != -1:
+                        for band_idx in range(idx_highest_globally_breached + 1):
+                            upper_dem = self.dem_contour_thresholds_viz[band_idx]
+                            lower_dem = self.dem_contour_thresholds_viz[band_idx-1] if band_idx > 0 else -np.inf
+                            
+                            # Fill DEM band if it's below the globally breached WSE level
+                            band_mask = (
+                                self.valid_mask &
+                                (self.dem > lower_dem) &
+                                (self.dem <= upper_dem) &
+                                (~(self.steady_state_h > self.min_depth))
+                            )
+                            layered_indices[band_mask] = band_idx 
+                    
+                    main_water_plot.set_array(np.ma.masked_where(layered_indices == -1, layered_indices))
+                    main_water_plot.set_cmap(self.layered_fill_cmap)
+                    main_water_plot.set_norm(self.layered_fill_norm)
+                    main_water_plot.set_alpha(0.80) 
+                    
+                    active_cmap, active_norm = main_water_plot.cmap, main_water_plot.norm
+                    artists.append(main_water_plot)
+                    cbar_lbl = 'DEM Contour Band'; title += ' - P2: Rainfall Flood Visualization'
+            else: 
+                fixed_river_underlay.set_visible(False)
+                mask_default = ~self.valid_mask | (current_h <= self.min_depth)
+                masked_data_default = np.ma.masked_where(mask_default, current_h)
+                
+                main_water_plot.set_array(masked_data_default)
+                main_water_plot.set_cmap(blue_cmap)
+                main_water_plot.set_norm(norm_blue)
+                main_water_plot.set_alpha(0.7); main_water_plot.set_visible(True)
+                
+                active_cmap, active_norm = blue_cmap, norm_blue
+                cbar_lbl = 'Water Depth (m)'
+                artists.append(main_water_plot)
 
-            changed_artists = [water_plot, sim_title]
-            return changed_artists
 
-        # Create Animation 
-        print("Creating animation object...")
-        use_blit = False 
-        anim = animation.FuncAnimation(
-            fig, update, frames=len(results),
-            interval=150, blit=use_blit, repeat=False
-        )
-        print("Animation object created.")
+            sim_title.set_text(title)
+            if cbar:
+                cbar.mappable.set_cmap(active_cmap)
+                cbar.mappable.set_norm(active_norm)
+                cbar.set_label(cbar_lbl)
+                
+                if use_global_wse_layered_viz and not is_p1 and self.dem_contour_thresholds_viz and self.layered_fill_cmap:
+                    num_t = len(self.dem_contour_thresholds_viz)
+                    if num_t > 0:
+                        t_pos = np.arange(num_t)
+                        t_lab = [f'{v:.1f}m' for v in self.dem_contour_thresholds_viz]
+                        if num_t > 8: 
+                            step_t = max(1, num_t//8)
+                            t_pos,t_lab = t_pos[::step_t],t_lab[::step_t]
+                        cbar.set_ticks(t_pos)
+                        cbar.set_ticklabels(t_lab)
+                else: 
+                    cbar.update_ticks()
+            return artists
 
-        # Adjust Layout 
-        # Use tight_layout or constrained_layout after creating all elements
+
+        anim = animation.FuncAnimation(fig, update, frames=len(results), interval=150, blit=False, repeat=False)
+
         try:
-            fig.tight_layout(pad=1.5) 
-        except Exception as e:
-            print(f"Warning: Could not apply tight_layout. {e}")
+            fig.tight_layout(pad=1.5)
+        except Exception as e_layout_viz:
+            print(f"Warning: Could not apply tight_layout. {e_layout_viz}")
 
-
-        # Save Animation 
         if output_path:
-            writer_name = None
-            if output_path.endswith('.gif'):
-                writer_name = 'pillow'
-            elif output_path.endswith('.mp4'):
-                writer_name = 'ffmpeg'
-            else:
-                print("Warning: Unknown animation format. Defaulting to GIF.")
+            writer_name_save_viz = 'pillow' if output_path.endswith('.gif') else 'ffmpeg' if output_path.endswith('.mp4') else None
+            if not writer_name_save_viz: 
                 output_path += ".gif"
-                writer_name = 'pillow'
-
-            if writer_name:
-                print(f"Saving animation to {output_path} (using {writer_name})... this may take a while...")
-                save_dpi = 120 # Lower DPI for faster saving
-                try:
-                    anim.save(output_path, writer=writer_name, fps=10, dpi=save_dpi)
-                    print("Animation saved.")
-                except Exception as e_save:
-                    print(f"ERROR saving animation: {e_save}")
-                    print("Ensure required libraries (pillow for GIF, ffmpeg for MP4) are installed.")
-
-        # Save Last Frame
-        if save_last_frame and output_path:
-            last_valid_frame_idx = -1
-            for i in range(len(results) - 1, -1, -1):
-                if results[i] is not None and results[i].size > 0:
-                    last_valid_frame_idx = i
-                    break
-
-            if last_valid_frame_idx >= 0:
-                print("Generating final frame...")
-                # Ensure the plot is updated to the last valid frame state
-                update(last_valid_frame_idx) # Call update to set the plot correctly
-                last_frame_path = output_path.rsplit('.', 1)[0] + '_final_frame.png'
-                try:
-                    plt.savefig(last_frame_path, dpi=200, bbox_inches='tight')
-                    print(f"Final frame saved to {last_frame_path}")
-                except Exception as e_frame:
-                    print(f"Error saving final frame: {e_frame}")
-            else:
-                print("Could not save last frame: No valid result frames found.")
-
-        # Show Animation
-        if show_animation:
-            print("Displaying animation window...")
+                writer_name_save_viz = 'pillow'
+            print(f"Saving animation to {output_path} (using {writer_name_save_viz})...")
             try:
-                plt.show()
-            except Exception as e_show:
-                print(f"Could not display animation interactively: {e_show}")
-                # Closes the figure if plt.show failed mid-way
-                try: plt.close(fig)
-                except Exception: pass
-        else:
-            # Close the figure immediately if not showing interactively
-            plt.close(fig)
+                anim.save(output_path, writer=writer_name_save_viz, fps=10, dpi=120)
+                print("Animation saved.")
+            except Exception as e_save_anim_viz:
+                print(f"ERROR saving animation: {e_save_anim_viz}. Ensure {writer_name_save_viz} is installed.")
 
+        if save_last_frame and output_path:
+            last_idx_save_viz = next((i_save_viz for i_save_viz in range(len(results)-1, -1, -1) if results[i_save_viz] is not None), -1)
+            if last_idx_save_viz >= 0:
+                update(last_idx_save_viz)
+                last_frame_path_save_viz = output_path.rsplit('.', 1)[0] + '_final_frame.png'
+                try:
+                    plt.savefig(last_frame_path_save_viz, dpi=200, bbox_inches='tight')
+                    print(f"Final frame saved to {last_frame_path_save_viz}")
+                except Exception as e_frame_save_viz: 
+                    print(f"Error saving final frame: {e_frame_save_viz}")
+
+        if show_animation:
+            try: 
+                plt.show()
+            except Exception as e_show_anim_viz: 
+                print(f"Could not display animation: {e_show_anim_viz}")
+        plt.close(fig)
         print("Visualization finished.")
         return anim
-
 
 def run_natural_river_phase1_for_twophase(args_test):
     """
@@ -758,14 +663,14 @@ def run_natural_river_phase1_for_twophase(args_test):
 
     # Use parameters from args_test for DEM generation and simulation
     print("Generating DEM for Phase 1...")
-    dem, valid_mask, start_center_row = create_natural_river_dem(
-        rows=args_test.rows, cols=args_test.cols,
-        base_elev=args_test.base_elev, main_slope=args_test.main_slope,
-        cross_slope=args_test.cross_slope, channel_width=args_test.channel_width,
-        channel_depth=args_test.channel_depth, meander_amplitude=args_test.meander_amplitude,
-        meander_freq=args_test.meander_freq, noise_sigma=args_test.noise_sigma,
-        noise_strength=args_test.noise_strength, final_smooth_sigma=args_test.final_smooth_sigma
-    )
+    
+    rows, cols = 100, 400
+    dx, dy = 5.0, 5.0
+    dem, valid_mask, start_center_row = create_natural_river_dem( 
+        rows=rows, cols=cols, base_elev=25.0, main_slope=0.001 * dx,
+        cross_slope=0.0, channel_width=10 * dx, channel_depth=3.0,
+        meander_amplitude=10.0, meander_freq=1.5, noise_sigma=2.0,
+        noise_strength=0.3, final_smooth_sigma=1.0 )
     nx, ny = dem.shape
 
     print(f"Initializing Phase 1 sim with outlet_percentile={args_test.outlet_percentile}.")
@@ -786,7 +691,7 @@ def run_natural_river_phase1_for_twophase(args_test):
 
     sim_p1.add_water_source(
         row=start_center_row, col=0, 
-        rate=args_test.source_rate, duration_steps=1,
+        rate=50, duration_steps=1,
     )
 
     print(f"\n--- Running Phase 1 Simulation for {args_test.phase1_steps} steps ---")
@@ -816,101 +721,74 @@ def run_twophase_river_rain_test(args):
         return
 
     last_time_phase1 = time_steps1[-1] if time_steps1 else 0.0
-    print(f"End of Phase 1 at Sim Time: {last_time_phase1:.2f} s")
-    final_h_phase1 = sim_phase1.h
-    h_valid_p1 = final_h_phase1[sim_phase1.valid_mask]
-    max_depth_p1 = np.nanmax(h_valid_p1) if h_valid_p1.size > 0 else 0.0
-    print(f"Phase 1 Final Max Depth: {max_depth_p1:.3f} m")
+    sim_phase1.steady_state_h = sim_phase1.h.copy()  # Capture h at end of phase 1
+    print(f"End of Phase 1 at Sim Time: {last_time_phase1:.2f}s. Stored steady_state_h.")
 
-    # Setup for Phase 2, continuing from Phase 1 state 
-    sim_phase1.steady_state_h = final_h_phase1.copy() # Capture h at end of phase 1
-    print("Stored final Phase 1 depth as steady_state_h for visualization.")
+    sim_phase1.sources = [] # Clear Phase 1 sources/patches
 
-    print(f"\n--- Starting Phase 2: Adding Rainfall ({args.phase2_steps} steps) ---")
-    rain_rate_mmhr = args.rain_rate
-    if rain_rate_mmhr <= 0:
-        print("No rainfall specified for Phase 2 (rain_rate <= 0).")
-        rain_rate_ms = 0.0
+    if args.source_row is not None and args.source_col is not None and args.source_rate > 0:
+        r, c = args.source_row, args.source_col
+        if 0 <= r < sim_phase1.dem.shape[0] and 0 <= c < sim_phase1.dem.shape[1] and sim_phase1.valid_mask[r,c]:
+            sim_phase1.add_water_source(row=r, col=c, rate=args.source_rate,
+                                        duration_steps=args.source_duration if args.source_duration is not None else args.phase2_steps)
+        else: print(f"Warning (P2): Source at ({r},{c}) invalid. Ignored.")
+
+    print(f"\n--- Starting Phase 2: Rainfall & WSE Monitoring ({args.phase2_steps} steps) ---")
+    if args.rain_rate > 0:
+        rain_rate_ms = args.rain_rate / (1000.0 * 3600.0)
+        sim_phase1.add_rainfall(rate=rain_rate_ms,
+                                duration_steps=args.rain_duration if args.rain_duration is not None else args.phase2_steps)
+        print(f"Added rainfall for Phase 2: {args.rain_rate} mm/hr")
     else:
-        rain_rate_ms = rain_rate_mmhr / (1000.0 * 3600.0)
-        print(f"Adding rainfall rate: {rain_rate_mmhr} mm/hr ({rain_rate_ms:.2e} m/s)")
-        # Add rainfall to the existing sim_phase1 object
-        sim_phase1.add_rainfall(rate=rain_rate_ms, duration_steps=args.phase2_steps)
+        print("No rainfall for Phase 2.")
 
-    # Also set the infiltration rate for phase 2 from args
-    infiltration_rate_mmhr = args.infiltration_rate
-    if infiltration_rate_mmhr > 0:
-        sim_phase1.infiltration_rate = infiltration_rate_mmhr / (1000.0*3600.0)
-        print(f"Setting infiltration rate for Phase 2: {infiltration_rate_mmhr} mm/hr ({sim_phase1.infiltration_rate:.2e} m/s)")
-    else:
+    if args.infiltration_rate > 0:
+        sim_phase1.infiltration_rate = args.infiltration_rate / (1000.0 * 3600.0)
+        print(f"Set infiltration for Phase 2: {args.infiltration_rate} mm/hr")
+    else: 
         sim_phase1.infiltration_rate = 0.0
-        print("Infiltration rate for Phase 2 is 0.")
 
-
-    # Run Phase 2 
-    sim_phase1.target_time = 9999999.0 # Let steps control this phase
-    sim_phase1.original_dt_guess = sim_phase1.dt # Reset dt guess based on current state? Optional.
-    print(f"Running Phase 2 for {args.phase2_steps} additional steps...")
+    sim_phase1.target_time = float('inf') # Let steps control P2 duration
     results2, time_steps2_relative = sim_phase1.run_simulation(
         num_steps=args.phase2_steps,
         output_freq=args.output_freq
     )
 
     if not results2:
-        print("Phase 2 did not produce results.")
-        # Still visualize phase 1 results?
-        if results1:
-            print("Visualizing Phase 1 results only.")
-            try:
-                sim_phase1.visualize_results(
-                    results1, time_steps1,
-                    output_path=args.output_path.replace(".","_phase1_only.") if args.output_path else 'river_phase1_only.gif',
-                    show_animation=not args.hide_animation, save_last_frame=args.save_last_frame,
-                    hillshade=not args.no_hillshade, contour_levels=args.contour_levels,
-                    show_boundary_mask=False, steady_state_viz_active=False # No custom viz for phase 1 only
-                )
-            except Exception as e: print(f"Error visualizing phase 1 results: {e}")
+        print("Phase 2 did not produce results."); # Optionally visualize P1 only
         return
 
+    total_time_rain = time_steps2_relative[-1] if time_steps2_relative else 0.0
+    max_depth_rain = np.nanmax(sim_phase1.h.copy())
+    steady_state_h_max = np.nanmax(sim_phase1.steady_state_h)
 
-    # Combine Results for Final Visualization 
-    print("Combining results for final visualization...")
-    # Adjust phase 2 time steps to be absolute (start after phase 1 ended)
-    adjusted_time_steps2 = [t + last_time_phase1 for t in time_steps2_relative]
+    rate_of_increase = (max_depth_rain - steady_state_h_max) / total_time_rain 
+    print(f"Phase 2 max depth: {max_depth_rain:.3f} m, steady state max depth: {steady_state_h_max:.3f} m, rate of increase: {rate_of_increase:.6f} m/s")       
 
+    adjusted_time_steps2 = [t for t in time_steps2_relative]
+    all_results = results1 + results2
+    all_time_steps = time_steps1 + adjusted_time_steps2
+    num_total_phase1_frames = len(results1)
 
-    if len(time_steps2_relative) > 0 and time_steps2_relative[0] < sim_phase1.dt * 1.1: # 
-        all_time_steps = time_steps1 + adjusted_time_steps2
-        print(f"Concatenated results: {len(results1)} (P1) + {len(results2)} (P2) = {len(all_results)} frames.")
-
-    else: # Step 0 of phase 2 was likely not saved by output_freq
-        all_results = results1 + results2
-        all_time_steps = time_steps1 + adjusted_time_steps2
-        print(f"Concatenated results: {len(results1)} (P1) + {len(results2)} (P2) = {len(all_results)} frames.")
-
-
-    # Visualize Combined Results with Custom Colormap 
-    if not all_results:
+    if not all_results: 
         print("No combined results to visualize.")
         return
 
-    print("\n--- Visualizing Combined River + Rainfall Results (Custom Colormap) ---")
+    print("\n--- Visualizing Combined River (P1) + WSE Contour Breach (P2) Results ---")
     try:
-        # Call visualize_results on the 'sim_phase1' object which now contains steady_state_h
         sim_phase1.visualize_results(
             all_results,
             all_time_steps,
-            output_path=args.output_path if args.output_path else 'river_then_rain_custom_viz.gif',
+            output_path=args.output_path if args.output_path else 'river_wse_contours.gif',
             show_animation=not args.hide_animation,
             save_last_frame=args.save_last_frame,
             hillshade=not args.no_hillshade,
-            contour_levels=args.contour_levels,
-            show_boundary_mask=False, # Hide mask for final combined plot
-            steady_state_viz_active=True # <<< ACTIVATE CUSTOM VISUALIZATION
+            contour_levels=args.contour_levels, # This is important for the WSE viz logic
+            show_boundary_mask=args.show_boundary_mask,
+            steady_state_viz_active=True, # ACTIVATE WSE VISUALIZATION MODES
+            num_phase1_frames=num_total_phase1_frames
         )
     except Exception as e:
-        print(f"\nERROR during final visualization: {e}")
-        import traceback
-        traceback.print_exc() # Print detailed traceback
+        print(f"\nERROR during final visualization: {e}"); import traceback; traceback.print_exc()
 
-    print("\n--- Two-Phase River + Rainfall Test (Custom Viz) Finished ---")
+    print("\n--- Two-Phase River + WSE Contour Breach Test Finished ---")
